@@ -1,0 +1,5 @@
+{
+  "name": "AI Data Agents",
+  "description": "Create and manage AI agents connected to your databases (ClickHouse, Oracle) using local LLMs.",
+  "requestFramePermissions": []
+}
