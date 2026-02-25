@@ -37,6 +37,7 @@ Les agents disponibles dans l'interface (type + description):
 | `clickhouse_table_manager` | ClickHouse Table Manager | Administre les tables ClickHouse avec garde-fous de sécurité. |
 | `clickhouse_writer` | ClickHouse Writer | Crée des tables temporaires et écrit des données en imposant le préfixe `agent_`. |
 | `clickhouse_specific` | ClickHouse Specific | Exécute des requêtes templates paramétrées (ex: `P1`, `P2`) remplies par le manager. |
+| `clickhouse_generic` | ClickHouse Generic Analyst | Gère des requêtes ClickHouse variées avec DAG d’analyse, SQL optimisé, EXPLAIN, garde-fous performance et synthèse métier. |
 | `unstructured_to_structured` | Unstructured to Structured | Extrait du JSON structuré depuis du texte non structuré selon un schéma. |
 | `email_cleaner` | Email Cleaner | Résume des emails bruyants en sections actionnables et concises. |
 | `file_assistant` | File Assistant | Répond à partir de fichiers locaux fournis (mode RAG léger sur fichiers). |

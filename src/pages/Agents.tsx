@@ -8,6 +8,7 @@ const AGENT_TYPES = [
   { id: 'clickhouse_table_manager', name: 'ClickHouse Table Manager' },
   { id: 'clickhouse_writer', name: 'ClickHouse Writer' },
   { id: 'clickhouse_specific', name: 'ClickHouse Specific' },
+  { id: 'clickhouse_generic', name: 'ClickHouse Generic Analyst' },
   { id: 'unstructured_to_structured', name: 'Unstructured to Structured' },
   { id: 'email_cleaner', name: 'Email Cleaner' },
   { id: 'file_assistant', name: 'File Assistant' },
@@ -75,6 +76,26 @@ const AGENT_TEMPLATES: Record<string, any> = {
     role: "ClickHouse Specific Query Runner",
     objectives: "Use predefined SQL templates with placeholders (P1, P2, ...) and render a safe final SQL query from runtime parameters.",
     persona: "Deterministic, strict, and SQL-focused."
+  },
+  clickhouse_generic: {
+    config: {
+      database_name: "analytics",
+      timezone: "UTC",
+      schema_context: "",
+      business_rules: "",
+      known_partition_keys: ["event_date"],
+      known_order_keys: ["event_time"],
+      materialized_views: [],
+      dictionaries: [],
+      enforce_explain: true,
+      enforce_limit_on_exploration: true,
+      default_exploration_limit: 200,
+      max_retry_on_error: 2,
+      anomaly_threshold_pct: 35
+    },
+    role: "Generic ClickHouse Analytics Expert",
+    objectives: "Handle diverse ClickHouse analytical queries with engine-aware optimization, guardrails, and clear business synthesis.",
+    persona: "Senior data analyst, performance-focused, and business-oriented."
   },
   unstructured_to_structured: {
     config: { output_schema: { type: "object", properties: { entities: { type: "array", items: { type: "string" } }, summary: { type: "string" } }, required: ["entities", "summary"] }, strict_json: true },
