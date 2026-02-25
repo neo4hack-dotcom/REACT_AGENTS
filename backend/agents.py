@@ -348,12 +348,107 @@ def _extract_urls_from_text(text: str) -> List[str]:
     urls: List[str] = []
     seen: set[str] = set()
     for raw in matches:
-        cleaned = raw.rstrip(").,;!?]")
-        if cleaned in seen:
+        cleaned = str(raw).strip().strip("<>[](){}\"'")
+        cleaned = cleaned.rstrip(").,;!?]")
+        parsed = urlparse(cleaned)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
-        seen.add(cleaned)
+        normalized = cleaned.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
         urls.append(cleaned)
     return urls
+
+
+def _normalize_navigation_url_candidates(urls: List[str]) -> tuple[List[str], List[str]]:
+    valid: List[str] = []
+    invalid: List[str] = []
+    seen_valid: set[str] = set()
+    seen_invalid: set[str] = set()
+
+    for raw in urls:
+        candidate = str(raw or "").strip().strip("<>[](){}\"'")
+        candidate = candidate.rstrip(").,;!?]")
+        if not candidate:
+            continue
+
+        parsed = urlparse(candidate)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            normalized = candidate.rstrip("/")
+            if normalized in seen_valid:
+                continue
+            seen_valid.add(normalized)
+            valid.append(candidate)
+            continue
+
+        normalized_invalid = candidate.lower()
+        if normalized_invalid in seen_invalid:
+            continue
+        seen_invalid.add(normalized_invalid)
+        invalid.append(candidate)
+
+    return valid, invalid
+
+
+def _extract_raw_navigation_tokens(text: str) -> List[str]:
+    matches = re.findall(r"https?://[^\s<>\"]*", text or "")
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        token = str(match or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(token)
+    return tokens
+
+
+def _build_recent_manager_trace(steps: List[Dict[str, Any]], limit: int = 8) -> str:
+    recent = steps[-limit:] if len(steps) > limit else steps
+    lines: List[str] = []
+    for step in recent:
+        status = str(step.get("status") or "unknown")
+        agent = str(step.get("agent") or "")
+        message = str(step.get("message") or "")
+        rationale = str(step.get("rationale") or "")
+        result = step.get("result")
+        result_answer = ""
+        if isinstance(result, dict):
+            result_answer = str(result.get("answer") or "")
+        parts = [f"status={status}"]
+        if agent:
+            parts.append(f"agent={agent}")
+        if message:
+            parts.append(f"message={message[:240]}")
+        if rationale:
+            parts.append(f"rationale={rationale[:240]}")
+        if result_answer:
+            parts.append(f"result={result_answer[:280]}")
+        lines.append("- " + " | ".join(parts))
+    return "\n".join(lines) if lines else "- (no prior steps)"
+
+
+def _plan_revision_summary(previous_plan: str, current_plan: str) -> str:
+    previous = str(previous_plan or "").strip()
+    current = str(current_plan or "").strip()
+    if not previous and not current:
+        return "No explicit plan was produced."
+    if not previous and current:
+        return "Initial plan established."
+    if previous == current:
+        return "Plan unchanged from previous iteration."
+    return "Plan updated based on new evidence."
+
+
+def _clip_text(value: str, max_chars: int = 1200) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
 
 
 def _extract_requested_item_limit(text: str, default_limit: int = 10, hard_max: int = 50) -> int:
@@ -2653,11 +2748,14 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 except Exception:
                     pass
         elif agent_type == "web_navigator":
-            navigation_urls = _extract_urls_from_text(user_input)
+            raw_tokens = _extract_raw_navigation_tokens(user_input)
+            navigation_urls, invalid_navigation_urls = _normalize_navigation_url_candidates(raw_tokens)
             if not navigation_urls:
                 start_url = str(config.get("start_url") or "").strip()
                 if start_url:
-                    navigation_urls = [start_url]
+                    fallback_urls, invalid_fallback = _normalize_navigation_url_candidates([start_url])
+                    navigation_urls = fallback_urls
+                    invalid_navigation_urls.extend(invalid_fallback)
 
             max_nav_steps = max(1, min(int(config.get("max_steps") or 5), 10))
             default_item_limit = int(config.get("max_links") or config.get("max_items") or 10)
@@ -2668,7 +2766,23 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 same_domain_only = True
             same_domain_only = bool(same_domain_only)
 
+            if invalid_navigation_urls:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "navigator_url_skipped",
+                        "agent": agent_label,
+                        "invalid_urls": invalid_navigation_urls[:10],
+                        "message": "Ignored malformed URL candidates before navigation.",
+                    },
+                )
+
             if len(navigation_urls) == 0:
+                details = (
+                    f" Invalid URL(s): {', '.join(invalid_navigation_urls[:5])}."
+                    if invalid_navigation_urls
+                    else ""
+                )
                 _emit_step(
                     on_step,
                     {
@@ -2677,7 +2791,13 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                         "message": "No URL provided to web navigator.",
                     },
                 )
-                return {"answer": "No URL provided. Please include a target URL or configure `start_url`."}
+                return {
+                    "answer": (
+                        "No valid URL provided. Please include a full URL with host "
+                        "(e.g. https://example.com) or configure `start_url`."
+                        + details
+                    )
+                }
 
             headers = {
                 "User-Agent": (
@@ -2774,6 +2894,7 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     "details": {
                         "links": payload,
                         "requested_urls": requested_urls,
+                        "invalid_urls": invalid_navigation_urls,
                         "failures": failures,
                     },
                 }
@@ -2793,7 +2914,14 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     "message": "Navigation finished with no extractable links.",
                 },
             )
-            return {"answer": fallback_message, "details": {"requested_urls": requested_urls, "failures": failures}}
+            return {
+                "answer": fallback_message,
+                "details": {
+                    "requested_urls": requested_urls,
+                    "invalid_urls": invalid_navigation_urls,
+                    "failures": failures,
+                },
+            }
         else:
             system_prompt = f"""Role: {config.get('role') or 'Assistant'}
 Persona: {config.get('persona') or 'Helpful'}
@@ -3049,6 +3177,9 @@ class ManagerState(TypedDict):
     final_answer: str
     unavailable_agents: Dict[int, str]
     successful_call_signatures: set[str]
+    attempted_call_signatures: set[str]
+    current_plan: str
+    plan_history: List[str]
 
 
 class MultiAgentManager:
@@ -3077,12 +3208,15 @@ class MultiAgentManager:
             "scratchpad": {},
             "current_step": 0,
             "agent_calls_count": 0,
-            "max_agent_calls": int(cfg.get("max_agent_calls") or 20),
-            "max_steps": int(cfg.get("max_steps") or 10),
+            "max_agent_calls": max(1, int(cfg.get("max_agent_calls") or 15)),
+            "max_steps": max(1, int(cfg.get("max_steps") or 8)),
             "done": False,
             "final_answer": "",
             "unavailable_agents": unavailable_agents,
             "successful_call_signatures": set(),
+            "attempted_call_signatures": set(),
+            "current_plan": "",
+            "plan_history": [],
         }
 
         def add_step(step: Dict[str, Any]) -> None:
@@ -3180,6 +3314,26 @@ class MultiAgentManager:
                 for agent in current_state["active_agents"]
                 if (_safe_int(agent.get("id")) or -1) in current_state["unavailable_agents"]
             ]
+            previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 1600) or "No prior plan yet."
+            recent_trace = _build_recent_manager_trace(current_state.get("steps") or [])
+            manager_policy_prompt = _clip_text(
+                str(current_state.get("manager_config", {}).get("system_prompt") or ""),
+                2400,
+            )
+
+            add_step(
+                {
+                    "status": "manager_iteration_start",
+                    "iteration": current_state["current_step"] + 1,
+                    "remaining_steps": max(current_state["max_steps"] - current_state["current_step"], 0),
+                    "remaining_agent_calls": max(
+                        current_state["max_agent_calls"] - current_state["agent_calls_count"],
+                        0,
+                    ),
+                    "current_plan": previous_plan,
+                }
+            )
+
             manager_prompt = f"""You are an advanced Multi-Agent Orchestrator.
 Available agents catalog (always use agent_id when possible and only choose from this list):
 {json.dumps(agent_catalog, ensure_ascii=False, indent=2)}
@@ -3187,12 +3341,21 @@ Available agents catalog (always use agent_id when possible and only choose from
 Unavailable agents (DO NOT CALL):
 {json.dumps(unavailable_summary, ensure_ascii=False, indent=2)}
 
+Manager operating prompt (must follow):
+{manager_policy_prompt or "No custom manager prompt provided. Use best orchestration practices."}
+
 Execution budget:
 - max_steps: {current_state["max_steps"]}
 - current_step: {current_state["current_step"]}
 - max_agent_calls: {current_state["max_agent_calls"]}
 - agent_calls_used: {current_state["agent_calls_count"]}
 - agent_calls_remaining: {max(current_state["max_agent_calls"] - current_state["agent_calls_count"], 0)}
+
+Previous plan from last iteration:
+{previous_plan}
+
+Recent execution trace:
+{recent_trace}
 
 Current Conversation History & Knowledge:
 {current_state['conversation_history']}
@@ -3212,11 +3375,15 @@ CRITICAL INSTRUCTIONS FOR LARGE DATA/SCHEMAS:
 5. You can update the "scratchpad" to store variables (schema, metrics, intermediate findings).
 6. If you have enough information, return "final_answer" immediately.
 7. For `clickhouse_specific` agents, provide explicit `query_name` and `params` whenever possible.
+8. You MUST re-check and refine your plan every iteration. Include what changed compared with the previous plan.
+9. Never re-dispatch an identical call (same agent + same input + same params context) already attempted before.
 
 Decide the next step. Return ONLY a valid JSON object with the following structure:
 {{
   "status": "thinking" | "calling_agent" | "final_answer",
   "current_plan": "Your updated step-by-step plan based on current knowledge",
+  "plan_revision": "What changed vs previous plan, or why unchanged",
+  "focus_check": "One-line reminder of current objective and open items",
   "rationale": "Why you are making this decision and how it optimizes the plan",
   "scratchpad_updates": {{ "key": "value" }},
   "calls": [{{"agent_id": 1, "agent_name": "optional fallback", "agent_type": "optional", "input": "highly detailed instruction with only required context", "query_name": "optional for clickhouse_specific", "params": {{"P1": "value"}}}}],
@@ -3233,11 +3400,31 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                 if isinstance(updates, dict):
                     current_state["scratchpad"] = {**current_state["scratchpad"], **updates}
 
-                rationale = decision.get("rationale")
-                plan = decision.get("current_plan")
-                add_step({"status": "manager_decision", "rationale": rationale, "plan": plan})
+                rationale = _clip_text(str(decision.get("rationale") or ""), 2000)
+                raw_plan = _clip_text(str(decision.get("current_plan") or ""), 3000)
+                previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 3000)
+                plan = raw_plan or previous_plan or "No explicit plan provided."
+                plan_revision = _clip_text(str(decision.get("plan_revision") or ""), 1200) or _plan_revision_summary(
+                    previous_plan,
+                    plan,
+                )
+                focus_check = _clip_text(str(decision.get("focus_check") or ""), 1200)
+                current_state["current_plan"] = plan
+                current_state["plan_history"].append(plan)
+
+                add_step(
+                    {
+                        "status": "manager_decision",
+                        "rationale": rationale,
+                        "plan": plan,
+                        "plan_revision": plan_revision,
+                        "focus_check": focus_check,
+                    }
+                )
                 current_state["conversation_history"] += (
                     f"\n[Manager Plan Updated]: {plan}\n"
+                    f"[Manager Plan Revision]: {plan_revision}\n"
+                    f"[Manager Focus Check]: {focus_check}\n"
                     f"[Manager Rationale]: {rationale}\n"
                 )
 
@@ -3319,13 +3506,13 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                             call_context = _extract_manager_call_context(call)
                             selected_id = _safe_int(selected.get("id"))
                             signature = _manager_call_signature(selected_id, call_input, call_context)
-                            if signature in current_state["successful_call_signatures"]:
+                            if signature in current_state["attempted_call_signatures"]:
                                 add_step(
                                     {
                                         "status": "manager_warning",
                                         "message": (
-                                            "Skipping redundant call because an equivalent successful "
-                                            f"call already exists for agent '{selected.get('name')}'."
+                                            "Skipping duplicate call because an equivalent call context "
+                                            f"was already attempted for agent '{selected.get('name')}'."
                                         ),
                                         "agent": selected.get("name"),
                                         "agent_id": selected_id,
@@ -3335,6 +3522,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                     }
                                 )
                                 continue
+                            current_state["attempted_call_signatures"].add(signature)
                             resolved_calls.append((call, selected, call_input, call_context, signature))
 
                         if len(resolved_calls) == 0:

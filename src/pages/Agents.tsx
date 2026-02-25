@@ -34,7 +34,7 @@ const AGENT_TEMPLATES: Record<string, any> = {
     system_prompt: "You are a helpful AI assistant. Answer the user's queries accurately and concisely."
   },
   manager: {
-    config: { max_steps: 5, max_agent_calls: 10 },
+    config: { max_steps: 8, max_agent_calls: 15 },
     role: "Multi-Agent Orchestrator",
     objectives: "Analyze the user's request, select the best specialized agents, and synthesize their outputs into a final answer.",
     persona: "Logical, strategic, and decisive.",
@@ -246,6 +246,12 @@ export default function Agents() {
     }
     const serialized = JSON.stringify(config);
     return serialized.length > 100 ? `${serialized.substring(0, 100)}...` : serialized;
+  };
+
+  const previewAgentPrompt = (value: string): string => {
+    const text = String(value || '').trim();
+    if (!text) return 'No prompt';
+    return text.length > 180 ? `${text.substring(0, 180)}...` : text;
   };
 
   const [agents, setAgents] = useState<any[]>([]);
@@ -615,6 +621,22 @@ export default function Agents() {
               </div>
             )}
 
+            {newAgent.agent_type === 'manager' && (
+              <div>
+                <label className="block text-sm font-medium text-amber-300 mb-2">Manager Prompt (Visible and Editable)</label>
+                <textarea
+                  rows={6}
+                  value={newAgent.system_prompt}
+                  onChange={e => setNewAgent({ ...newAgent, system_prompt: e.target.value })}
+                  placeholder="Describe manager orchestration behavior, planning strategy, and constraints..."
+                  className="w-full bg-zinc-950 border border-amber-600/40 rounded-xl px-4 py-2.5 text-zinc-100 focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none resize-none"
+                />
+                <p className="text-xs text-amber-200/70 mt-2">
+                  This prompt is passed to the backend manager orchestrator and used at every planning iteration.
+                </p>
+              </div>
+            )}
+
             {newAgent.agent_type !== 'custom' && (
               <div>
                 <label className="block text-sm font-medium text-zinc-400 mb-2">Advanced Config (JSON)</label>
@@ -661,52 +683,76 @@ export default function Agents() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {agents.map(agent => (
-          <div key={agent.id} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 flex flex-col">
-            <div className="flex items-start justify-between mb-4">
-              <div className="p-3 bg-emerald-500/10 text-emerald-500 rounded-xl">
-                <Bot className="w-6 h-6" />
+        {agents.map(agent => {
+          const isManager = agent.agent_type === 'manager';
+          const typeLabel = AGENT_TYPES.find(t => t.id === agent.agent_type)?.name || agent.role || 'Agent';
+          const cardPreview = isManager
+            ? previewAgentPrompt(agent.system_prompt || '')
+            : (agent.agent_type === 'custom' ? (agent.system_prompt || 'No prompt') : previewAgentConfig(agent.config));
+
+          return (
+            <div
+              key={agent.id}
+              className={`rounded-2xl p-6 flex flex-col ${
+                isManager
+                  ? 'bg-amber-950/30 border border-amber-500/40 shadow-[0_0_0_1px_rgba(251,191,36,0.18)]'
+                  : 'bg-zinc-900 border border-zinc-800'
+              }`}
+            >
+              <div className="flex items-start justify-between mb-4">
+                <div className={`p-3 rounded-xl ${isManager ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/10 text-emerald-500'}`}>
+                  <Bot className="w-6 h-6" />
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => openEditForm(agent)}
+                    className={`p-2 rounded-lg transition-colors ${
+                      isManager
+                        ? 'text-amber-200/70 hover:text-amber-100 hover:bg-amber-500/15'
+                        : 'text-zinc-500 hover:text-emerald-400 hover:bg-emerald-500/10'
+                    }`}
+                    title="Edit agent"
+                  >
+                    <Pencil className="w-5 h-5" />
+                  </button>
+                  <button
+                    onClick={() => deleteAgent(agent.id)}
+                    className="p-2 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors"
+                    title="Delete agent"
+                  >
+                    <Trash2 className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => openEditForm(agent)}
-                  className="p-2 text-zinc-500 hover:text-emerald-400 hover:bg-emerald-500/10 rounded-lg transition-colors"
-                  title="Edit agent"
-                >
-                  <Pencil className="w-5 h-5" />
-                </button>
-                <button
-                  onClick={() => deleteAgent(agent.id)}
-                  className="p-2 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors"
-                  title="Delete agent"
-                >
-                  <Trash2 className="w-5 h-5" />
-                </button>
+              <h3 className="text-xl font-bold text-white mb-1">{agent.name}</h3>
+              <p className={`text-sm font-medium mb-3 ${isManager ? 'text-amber-300' : 'text-emerald-500'}`}>
+                {typeLabel}
+              </p>
+              <p className={`text-sm line-clamp-3 mb-4 flex-1 ${isManager ? 'text-amber-100/80' : 'text-zinc-400'}`}>
+                {cardPreview}
+              </p>
+              <div className="flex flex-wrap gap-2 mt-auto">
+                {isManager && (
+                  <div className="flex items-center gap-1.5 text-xs text-amber-200 bg-amber-500/20 px-2.5 py-1 rounded-lg w-fit">
+                    <span>Manager</span>
+                  </div>
+                )}
+                {agent.db_config_id && (
+                  <div className="flex items-center gap-1.5 text-xs text-blue-400 bg-blue-500/10 px-2.5 py-1 rounded-lg w-fit">
+                    <Database className="w-3 h-3" />
+                    <span>DB Connected</span>
+                  </div>
+                )}
+                {agent.agent_type !== 'custom' && (
+                  <div className="flex items-center gap-1.5 text-xs text-purple-400 bg-purple-500/10 px-2.5 py-1 rounded-lg w-fit">
+                    <Settings className="w-3 h-3" />
+                    <span>Configured</span>
+                  </div>
+                )}
               </div>
             </div>
-            <h3 className="text-xl font-bold text-white mb-1">{agent.name}</h3>
-            <p className="text-emerald-500 text-sm font-medium mb-3">
-              {AGENT_TYPES.find(t => t.id === agent.agent_type)?.name || agent.role || 'Agent'}
-            </p>
-            <p className="text-zinc-400 text-sm line-clamp-3 mb-4 flex-1">
-              {agent.agent_type === 'custom' ? (agent.system_prompt || 'No prompt') : previewAgentConfig(agent.config)}
-            </p>
-            <div className="flex flex-wrap gap-2 mt-auto">
-              {agent.db_config_id && (
-                <div className="flex items-center gap-1.5 text-xs text-blue-400 bg-blue-500/10 px-2.5 py-1 rounded-lg w-fit">
-                  <Database className="w-3 h-3" />
-                  <span>DB Connected</span>
-                </div>
-              )}
-              {agent.agent_type !== 'custom' && (
-                <div className="flex items-center gap-1.5 text-xs text-purple-400 bg-purple-500/10 px-2.5 py-1 rounded-lg w-fit">
-                  <Settings className="w-3 h-3" />
-                  <span>Configured</span>
-                </div>
-              )}
-            </div>
-          </div>
-        ))}
+          );
+        })}
 
         {agents.length === 0 && !isCreating && (
           <div className="col-span-full text-center py-12 text-zinc-500 border border-dashed border-zinc-800 rounded-2xl">
