@@ -21,6 +21,19 @@ class AgentResult(TypedDict, total=False):
     details: Any
 
 
+StepCallback = Callable[[Dict[str, Any]], None]
+
+
+def _emit_step(on_step: StepCallback | None, step: Dict[str, Any]) -> None:
+    if not on_step:
+        return
+    try:
+        on_step(step)
+    except Exception:
+        # Streaming callbacks should never break agent execution.
+        return
+
+
 def _coerce_message_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -66,11 +79,140 @@ def build_agent_execution_config(agent: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _is_generic_orchestration_text(value: str) -> bool:
+    lowered = value.strip().lower()
+    if not lowered:
+        return True
+
+    generic_markers = (
+        "starting multi-agent orchestration",
+        "response ready",
+        "analyzing request and preparing context",
+        "generating response with the language model",
+        "model response received",
+    )
+    return any(marker in lowered for marker in generic_markers)
+
+
+def _extract_manager_answer_from_steps(steps: List[Dict[str, Any]]) -> str:
+    for step in reversed(steps):
+        status = str(step.get("status") or "")
+
+        if status in {"manager_final", "manager_finalized_fallback"}:
+            for key in ("answer", "manager_summary"):
+                value = step.get(key)
+                if isinstance(value, str) and value.strip() and not _is_generic_orchestration_text(value):
+                    return value.strip()
+
+        if status in {"agent_call_completed"}:
+            result = step.get("result")
+            if isinstance(result, dict):
+                value = result.get("answer")
+                if isinstance(value, str) and value.strip() and not _is_generic_orchestration_text(value):
+                    return value.strip()
+
+        if status in {"agent_call_failed", "manager_finalize_failed", "error"}:
+            for key in ("error", "message"):
+                value = step.get(key)
+                if isinstance(value, str) and value.strip() and not _is_generic_orchestration_text(value):
+                    return value.strip()
+    return ""
+
+
+def _summarize_steps_for_synthesis(steps: List[Dict[str, Any]], max_steps: int = 25) -> str:
+    lines: List[str] = []
+    for step in steps[-max_steps:]:
+        status = str(step.get("status") or "unknown")
+        agent = str(step.get("agent") or "")
+        message = str(step.get("message") or "")
+        rationale = str(step.get("rationale") or "")
+        result = step.get("result")
+        result_text = ""
+        if isinstance(result, dict):
+            result_text = str(result.get("answer") or "")
+        sql = str(step.get("sql") or "")
+
+        parts = [f"status={status}"]
+        if agent:
+            parts.append(f"agent={agent}")
+        if message:
+            parts.append(f"message={message}")
+        if rationale:
+            parts.append(f"rationale={rationale}")
+        if result_text:
+            parts.append(f"result={result_text}")
+        if sql:
+            parts.append(f"sql={sql[:400]}")
+        lines.append("- " + " | ".join(parts))
+
+    return "\n".join(lines)
+
+
+async def _synthesize_manager_fallback_answer(
+    llm: Any,
+    user_input: str,
+    conversation_history: str,
+    scratchpad: Dict[str, Any],
+    steps: List[Dict[str, Any]],
+) -> str:
+    prompt = f"""You are finalizing a manager-orchestrated task.
+Generate a complete, user-facing final answer based on the execution trace.
+Do not mention internal implementation details.
+If information is missing, state exactly what is missing.
+
+Return ONLY JSON:
+{{ "final_answer": "..." }}
+
+User request:
+{user_input}
+
+Conversation history:
+{conversation_history}
+
+Scratchpad:
+{json.dumps(scratchpad, ensure_ascii=False)}
+
+Execution steps:
+{_summarize_steps_for_synthesis(steps)}
+"""
+
+    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    content = _coerce_message_content(response.content).strip()
+    if not content:
+        return ""
+
+    try:
+        parsed = json.loads(_extract_json_block(content))
+        if isinstance(parsed, dict):
+            return str(parsed.get("final_answer") or parsed.get("answer") or "").strip()
+    except Exception:
+        pass
+
+    return content
+
+
 class AgentExecutor:
     @staticmethod
-    async def execute(agent_type: str, config: Dict[str, Any], user_input: str, llm: Any) -> AgentResult:
+    async def execute(
+        agent_type: str,
+        config: Dict[str, Any],
+        user_input: str,
+        llm: Any,
+        on_step: StepCallback | None = None,
+        agent_name: str | None = None,
+    ) -> AgentResult:
         system_prompt = "You are a helpful AI assistant."
         extra_context = ""
+        agent_label = agent_name or agent_type or "agent"
+
+        _emit_step(
+            on_step,
+            {
+                "status": "agent_thinking",
+                "agent": agent_label,
+                "message": "Analyzing request and preparing context.",
+            },
+        )
 
         if agent_type == "sql_analyst":
             system_prompt = f"""You are a Senior ClickHouse Expert and SQL Analyst. Database: {config.get('database_name') or 'Unknown'}. 
@@ -323,6 +465,14 @@ Objectives: {config.get('objectives') or 'Assist the user'}
 Instructions: {config.get('system_prompt') or ''}"""
 
         try:
+            _emit_step(
+                on_step,
+                {
+                    "status": "llm_call_started",
+                    "agent": agent_label,
+                    "message": "Generating response with the language model.",
+                },
+            )
             response = await llm.ainvoke(
                 [
                     SystemMessage(content=system_prompt),
@@ -331,23 +481,77 @@ Instructions: {config.get('system_prompt') or ''}"""
             )
             content = _coerce_message_content(response.content)
 
+            _emit_step(
+                on_step,
+                {
+                    "status": "llm_response_received",
+                    "agent": agent_label,
+                    "message": "Model response received. Preparing final answer.",
+                },
+            )
+
             if content.strip().startswith("{") or agent_type != "custom":
                 try:
                     json_payload = json.loads(_extract_json_block(content))
-                    return {
+                    result: AgentResult = {
                         "answer": json_payload.get("answer")
                         or (json.dumps(json_payload) if agent_type == "unstructured_to_structured" else "JSON parsed successfully."),
                         "sql": json_payload.get("sql"),
                         "rows": json_payload.get("rows") or [],
                         "details": json_payload,
                     }
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "agent_completed",
+                            "agent": agent_label,
+                            "message": "Response ready.",
+                        },
+                    )
+                    return result
                 except Exception:
                     if agent_type == "unstructured_to_structured":
-                        return {"answer": f"Fallback raw output:\n{content}"}
-                    return {"answer": content}
+                        fallback_result = {"answer": f"Fallback raw output:\n{content}"}
+                        _emit_step(
+                            on_step,
+                            {
+                                "status": "agent_completed",
+                                "agent": agent_label,
+                                "message": "Response ready.",
+                            },
+                        )
+                        return fallback_result
+                    plain_result = {"answer": content}
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "agent_completed",
+                            "agent": agent_label,
+                            "message": "Response ready.",
+                        },
+                    )
+                    return plain_result
 
-            return {"answer": content}
+            plain_result = {"answer": content}
+            _emit_step(
+                on_step,
+                {
+                    "status": "agent_completed",
+                    "agent": agent_label,
+                    "message": "Response ready.",
+                },
+            )
+            return plain_result
         except Exception as exc:
+            _emit_step(
+                on_step,
+                {
+                    "status": "agent_error",
+                    "agent": agent_label,
+                    "error": str(exc),
+                    "message": "Agent execution failed.",
+                },
+            )
             return {"answer": f"Error executing agent: {exc}"}
 
 
@@ -517,6 +721,8 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                 execution_config,
                                 call_input,
                                 current_state["llm"],
+                                on_step=add_step,
+                                agent_name=selected.get("name") or selected.get("agent_type") or "agent",
                             )
                             add_step(
                                 {
@@ -569,7 +775,52 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
         graph = workflow.compile()
 
         final_state = await graph.ainvoke(state)
+        steps = final_state.get("steps")
+        if not isinstance(steps, list):
+            steps = []
+
+        final_answer = str(final_state.get("final_answer") or "").strip()
+        if not final_answer:
+            final_answer = _extract_manager_answer_from_steps(steps)
+
+        if not final_answer:
+            try:
+                synthesized = await _synthesize_manager_fallback_answer(
+                    llm=final_state.get("llm"),
+                    user_input=user_input,
+                    conversation_history=str(final_state.get("conversation_history") or ""),
+                    scratchpad=final_state.get("scratchpad") if isinstance(final_state.get("scratchpad"), dict) else {},
+                    steps=steps,
+                )
+                if synthesized:
+                    final_answer = synthesized
+                    steps.append(
+                        {
+                            "status": "manager_finalized_fallback",
+                            "answer": final_answer,
+                            "manager_summary": "Fallback synthesis generated because manager did not provide a final answer.",
+                        }
+                    )
+            except Exception as exc:
+                steps.append(
+                    {
+                        "status": "manager_finalize_failed",
+                        "error": str(exc),
+                        "message": "Failed to synthesize fallback final answer.",
+                    }
+                )
+
+        if not final_answer:
+            final_answer = "Manager completed orchestration but did not produce a final answer."
+            steps.append(
+                {
+                    "status": "manager_finalized_fallback",
+                    "answer": final_answer,
+                    "manager_summary": "Default fallback answer used.",
+                }
+            )
+
         return {
-            "answer": final_state["final_answer"],
-            "steps": final_state["steps"],
+            "answer": final_answer,
+            "steps": steps,
         }
