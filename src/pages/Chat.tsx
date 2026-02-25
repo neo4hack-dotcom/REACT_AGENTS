@@ -257,6 +257,20 @@ export default function Chat() {
     }
   };
 
+  const syncActiveThreadMessages = async (threadId: number | null) => {
+    if (!threadId) return;
+    try {
+      const detail = await fetchThreadDetail(threadId);
+      if (!detail) return;
+      if (detail.agent_id) {
+        setSelectedAgentId(String(detail.agent_id));
+      }
+      setMessages(mapStoredMessages(detail.messages));
+    } catch (e) {
+      console.error('Failed to sync thread messages', e);
+    }
+  };
+
   const toggleDetails = (messageId: string) => {
     setMessages(prev => {
       return prev.map(message => (
@@ -408,6 +422,7 @@ export default function Chat() {
         setSelectedThreadId(responseThreadId);
       }
       await refreshThreads(responseThreadId);
+      await syncActiveThreadMessages(responseThreadId);
     } catch (e: any) {
       setMessages(prev => {
         return prev.map(message => (
