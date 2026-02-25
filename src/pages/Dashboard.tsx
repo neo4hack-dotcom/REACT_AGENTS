@@ -1,20 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { Bot, Database, Cpu } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
 
 export default function Dashboard() {
   const [stats, setStats] = useState({ agents: 0, dbs: 0, llm: null as any });
-  const { token } = useAuth();
 
   useEffect(() => {
     async function fetchStats() {
-      if (!token) return;
       try {
-        const headers = { Authorization: `Bearer ${token}` };
         const [agentsRes, dbsRes, llmRes] = await Promise.all([
-          fetch('/api/agents', { headers }),
-          fetch('/api/config/db', { headers }),
-          fetch('/api/config/llm', { headers })
+          fetch('/api/agents'),
+          fetch('/api/config/db'),
+          fetch('/api/config/llm')
         ]);
         
         const agents = await agentsRes.json();
@@ -31,7 +27,7 @@ export default function Dashboard() {
       }
     }
     fetchStats();
-  }, [token]);
+  }, []);
 
   return (
     <div className="p-8 max-w-6xl mx-auto">

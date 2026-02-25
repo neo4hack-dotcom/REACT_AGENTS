@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { Bot, Plus, Trash2, Database, Settings } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
 
 const AGENT_TYPES = [
   { id: 'custom', name: 'Custom Agent' },
@@ -170,14 +169,11 @@ export default function Agents() {
     db_config_id: '',
     configStr: JSON.stringify(AGENT_TEMPLATES['custom'].config, null, 2)
   });
-  const { token } = useAuth();
 
   useEffect(() => {
-    if (token) {
-      fetchAgents();
-      fetchDbConfigs();
-    }
-  }, [token]);
+    fetchAgents();
+    fetchDbConfigs();
+  }, []);
 
   const readErrorMessage = async (res: Response) => {
     const contentType = res.headers.get('content-type') || '';
@@ -215,11 +211,8 @@ export default function Agents() {
   };
 
   const fetchAgents = async () => {
-    if (!token) return;
     try {
-      const res = await fetch('/api/agents', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await fetch('/api/agents');
       if (!res.ok) {
         throw new Error(await readErrorMessage(res));
       }
@@ -231,11 +224,8 @@ export default function Agents() {
   };
 
   const fetchDbConfigs = async () => {
-    if (!token) return;
     try {
-      const res = await fetch('/api/config/db', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await fetch('/api/config/db');
       if (!res.ok) {
         throw new Error(await readErrorMessage(res));
       }
@@ -248,11 +238,6 @@ export default function Agents() {
 
   const createAgent = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!token) {
-      alert("Session expired. Please sign in again.");
-      return;
-    }
-
     let parsedConfig = {};
     try {
       parsedConfig = JSON.parse(newAgent.configStr);
@@ -264,7 +249,7 @@ export default function Agents() {
     try {
       const res = await fetch('/api/agents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...newAgent,
           config: parsedConfig,
@@ -287,14 +272,8 @@ export default function Agents() {
   };
 
   const deleteAgent = async (id: number) => {
-    if (!token) {
-      alert("Session expired. Please sign in again.");
-      return;
-    }
-
     await fetch(`/api/agents/${id}`, { 
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` }
+      method: 'DELETE'
     });
     fetchAgents();
   };

@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, Loader2 } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
 import Markdown from 'react-markdown';
 
 export default function Chat() {
@@ -10,20 +9,17 @@ export default function Chat() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { token } = useAuth();
 
   useEffect(() => {
-    if (token) fetchAgents();
-  }, [token]);
+    fetchAgents();
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   const fetchAgents = async () => {
-    const res = await fetch('/api/agents', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const res = await fetch('/api/agents');
     const data = await res.json();
     setAgents(data);
     if (data.length > 0) {
@@ -49,7 +45,7 @@ export default function Chat() {
     try {
       const res = await fetch(`/api/chat/${selectedAgentId}?stream=true`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: userMsg, threadId: 'session-1' })
       });
       
