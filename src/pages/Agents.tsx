@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Bot, Plus, Trash2, Database, Settings } from 'lucide-react';
+import { Bot, Plus, Trash2, Database, Settings, Pencil } from 'lucide-react';
 
 const AGENT_TYPES = [
   { id: 'custom', name: 'Custom Agent' },
@@ -154,26 +154,89 @@ const AGENT_TEMPLATES: Record<string, any> = {
 };
 
 export default function Agents() {
+  type AgentFormState = {
+    name: string;
+    agent_type: string;
+    role: string;
+    objectives: string;
+    persona: string;
+    tools: string;
+    memory_settings: string;
+    system_prompt: string;
+    db_config_id: string;
+    configStr: string;
+  };
+
+  const buildDefaultAgentState = (): AgentFormState => {
+    const template = AGENT_TEMPLATES['custom'];
+    return {
+      name: '',
+      agent_type: 'custom',
+      role: template.role || '',
+      objectives: template.objectives || '',
+      persona: template.persona || '',
+      tools: '',
+      memory_settings: 'short_term',
+      system_prompt: template.system_prompt || '',
+      db_config_id: '',
+      configStr: JSON.stringify(template.config || {}, null, 2),
+    };
+  };
+
+  const parseAgentConfig = (rawConfig: any): Record<string, any> => {
+    if (!rawConfig) return {};
+    if (typeof rawConfig === 'object') return rawConfig;
+    if (typeof rawConfig === 'string') {
+      try {
+        const parsed = JSON.parse(rawConfig);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch (_err) {
+        return {};
+      }
+    }
+    return {};
+  };
+
+  const buildAgentStateFromExisting = (agent: any): AgentFormState => {
+    const template = AGENT_TEMPLATES[agent.agent_type] || AGENT_TEMPLATES['custom'];
+    const parsedConfig = parseAgentConfig(agent.config);
+    const configToDisplay = Object.keys(parsedConfig).length > 0 ? parsedConfig : (template.config || {});
+
+    return {
+      name: agent.name || '',
+      agent_type: agent.agent_type || 'custom',
+      role: agent.role || template.role || '',
+      objectives: agent.objectives || template.objectives || '',
+      persona: agent.persona || template.persona || '',
+      tools: agent.tools || '',
+      memory_settings: agent.memory_settings || 'short_term',
+      system_prompt: agent.system_prompt || template.system_prompt || '',
+      db_config_id: agent.db_config_id ? String(agent.db_config_id) : '',
+      configStr: JSON.stringify(configToDisplay, null, 2),
+    };
+  };
+
+  const previewAgentConfig = (rawConfig: any): string => {
+    const config = parseAgentConfig(rawConfig);
+    if (Object.keys(config).length === 0) {
+      return 'No config';
+    }
+    const serialized = JSON.stringify(config);
+    return serialized.length > 100 ? `${serialized.substring(0, 100)}...` : serialized;
+  };
+
   const [agents, setAgents] = useState<any[]>([]);
   const [dbConfigs, setDbConfigs] = useState<any[]>([]);
   const [isCreating, setIsCreating] = useState(false);
-  const [newAgent, setNewAgent] = useState({ 
-    name: '', 
-    agent_type: 'custom',
-    role: AGENT_TEMPLATES['custom'].role,
-    objectives: AGENT_TEMPLATES['custom'].objectives,
-    persona: AGENT_TEMPLATES['custom'].persona,
-    tools: '',
-    memory_settings: 'short_term',
-    system_prompt: AGENT_TEMPLATES['custom'].system_prompt, 
-    db_config_id: '',
-    configStr: JSON.stringify(AGENT_TEMPLATES['custom'].config, null, 2)
-  });
+  const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
+  const [newAgent, setNewAgent] = useState<AgentFormState>(buildDefaultAgentState());
 
   useEffect(() => {
     fetchAgents();
     fetchDbConfigs();
   }, []);
+
+  const isEditing = editingAgentId !== null;
 
   const readErrorMessage = async (res: Response) => {
     const contentType = res.headers.get('content-type') || '';
@@ -197,17 +260,35 @@ export default function Agents() {
     return `${res.status} ${res.statusText}`.trim();
   };
 
+  const closeForm = () => {
+    setIsCreating(false);
+    setEditingAgentId(null);
+    setNewAgent(buildDefaultAgentState());
+  };
+
+  const openCreateForm = () => {
+    setEditingAgentId(null);
+    setNewAgent(buildDefaultAgentState());
+    setIsCreating(true);
+  };
+
+  const openEditForm = (agent: any) => {
+    setEditingAgentId(agent.id);
+    setNewAgent(buildAgentStateFromExisting(agent));
+    setIsCreating(true);
+  };
+
   const handleAgentTypeChange = (type: string) => {
     const template = AGENT_TEMPLATES[type] || AGENT_TEMPLATES['custom'];
-    setNewAgent({
-      ...newAgent,
+    setNewAgent(prev => ({
+      ...prev,
       agent_type: type,
       role: template.role || '',
       objectives: template.objectives || '',
       persona: template.persona || '',
       system_prompt: template.system_prompt || '',
-      configStr: JSON.stringify(template.config || {}, null, 2)
-    });
+      configStr: JSON.stringify(template.config || {}, null, 2),
+    }));
   };
 
   const fetchAgents = async () => {
@@ -236,35 +317,47 @@ export default function Agents() {
     }
   };
 
-  const createAgent = async (e: React.FormEvent) => {
+  const saveAgent = async (e: React.FormEvent) => {
     e.preventDefault();
     let parsedConfig = {};
+
     try {
       parsedConfig = JSON.parse(newAgent.configStr);
-    } catch (e) {
-      alert("Invalid JSON in Advanced Config");
+    } catch (_err) {
+      alert('Invalid JSON in Advanced Config');
       return;
     }
 
+    const payload = {
+      name: newAgent.name,
+      agent_type: newAgent.agent_type,
+      role: newAgent.role,
+      objectives: newAgent.objectives,
+      persona: newAgent.persona,
+      tools: newAgent.tools,
+      memory_settings: newAgent.memory_settings,
+      system_prompt: newAgent.system_prompt,
+      config: parsedConfig,
+      db_config_id: newAgent.db_config_id ? parseInt(newAgent.db_config_id, 10) : null,
+    };
+
+    const method = isEditing ? 'PUT' : 'POST';
+    const path = isEditing ? `/api/agents/${editingAgentId}` : '/api/agents';
+
     try {
-      const res = await fetch('/api/agents', {
-        method: 'POST',
+      const res = await fetch(path, {
+        method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...newAgent,
-          config: parsedConfig,
-          db_config_id: newAgent.db_config_id ? parseInt(newAgent.db_config_id) : null
-        })
+        body: JSON.stringify(payload),
       });
-      
+
       if (!res.ok) {
         const message = await readErrorMessage(res);
-        alert(`Failed to create agent: ${message}`);
+        alert(`Failed to ${isEditing ? 'update' : 'create'} agent: ${message}`);
         return;
       }
-      
-      setIsCreating(false);
-      setNewAgent({ name: '', agent_type: 'custom', role: '', objectives: '', persona: '', tools: '', memory_settings: 'short_term', system_prompt: '', db_config_id: '', configStr: '{}' });
+
+      closeForm();
       fetchAgents();
     } catch (e: any) {
       alert(`Error: ${e.message}`);
@@ -272,18 +365,23 @@ export default function Agents() {
   };
 
   const deleteAgent = async (id: number) => {
-    await fetch(`/api/agents/${id}`, { 
-      method: 'DELETE'
-    });
-    fetchAgents();
+    try {
+      const res = await fetch(`/api/agents/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+      fetchAgents();
+    } catch (e: any) {
+      alert(`Failed to delete agent: ${e.message}`);
+    }
   };
 
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-8">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold text-white">AI Agents</h1>
-        <button 
-          onClick={() => setIsCreating(true)}
+        <button
+          onClick={openCreateForm}
           className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2.5 rounded-xl font-medium transition-colors"
         >
           <Plus className="w-5 h-5" />
@@ -293,23 +391,23 @@ export default function Agents() {
 
       {isCreating && (
         <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 mb-8">
-          <h2 className="text-xl font-semibold text-white mb-6">Create New Agent</h2>
-          <form onSubmit={createAgent} className="space-y-6">
+          <h2 className="text-xl font-semibold text-white mb-6">{isEditing ? 'Edit Agent' : 'Create New Agent'}</h2>
+          <form onSubmit={saveAgent} className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div>
                 <label className="block text-sm font-medium text-zinc-400 mb-2">Agent Name</label>
-                <input 
+                <input
                   required
                   type="text"
                   value={newAgent.name}
-                  onChange={e => setNewAgent({...newAgent, name: e.target.value})}
+                  onChange={e => setNewAgent({ ...newAgent, name: e.target.value })}
                   placeholder="e.g., Sales Data Analyst"
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-zinc-400 mb-2">Agent Type</label>
-                <select 
+                <select
                   value={newAgent.agent_type}
                   onChange={e => handleAgentTypeChange(e.target.value)}
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
@@ -324,49 +422,49 @@ export default function Agents() {
                 <>
                   <div>
                     <label className="block text-sm font-medium text-zinc-400 mb-2">Role</label>
-                    <input 
+                    <input
                       type="text"
                       value={newAgent.role}
-                      onChange={e => setNewAgent({...newAgent, role: e.target.value})}
+                      onChange={e => setNewAgent({ ...newAgent, role: e.target.value })}
                       placeholder="e.g., Data Analyst, Customer Support"
                       className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                     />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-zinc-400 mb-2">Objectives</label>
-                    <input 
+                    <input
                       type="text"
                       value={newAgent.objectives}
-                      onChange={e => setNewAgent({...newAgent, objectives: e.target.value})}
+                      onChange={e => setNewAgent({ ...newAgent, objectives: e.target.value })}
                       placeholder="e.g., Analyze sales trends, answer queries"
                       className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                     />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-zinc-400 mb-2">Persona</label>
-                    <input 
+                    <input
                       type="text"
                       value={newAgent.persona}
-                      onChange={e => setNewAgent({...newAgent, persona: e.target.value})}
+                      onChange={e => setNewAgent({ ...newAgent, persona: e.target.value })}
                       placeholder="e.g., Professional, Friendly, Concise"
                       className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                     />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-zinc-400 mb-2">Tools Available</label>
-                    <input 
+                    <input
                       type="text"
                       value={newAgent.tools}
-                      onChange={e => setNewAgent({...newAgent, tools: e.target.value})}
+                      onChange={e => setNewAgent({ ...newAgent, tools: e.target.value })}
                       placeholder="e.g., SQL Query, Web Search"
                       className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                     />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-zinc-400 mb-2">Memory Settings</label>
-                    <select 
+                    <select
                       value={newAgent.memory_settings}
-                      onChange={e => setNewAgent({...newAgent, memory_settings: e.target.value})}
+                      onChange={e => setNewAgent({ ...newAgent, memory_settings: e.target.value })}
                       className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
                     >
                       <option value="none">No Memory</option>
@@ -377,14 +475,14 @@ export default function Agents() {
                 </>
               )}
             </div>
-            
+
             {newAgent.agent_type === 'custom' && (
               <div>
                 <label className="block text-sm font-medium text-zinc-400 mb-2">System Prompt / Instructions</label>
-                <textarea 
+                <textarea
                   rows={4}
                   value={newAgent.system_prompt}
-                  onChange={e => setNewAgent({...newAgent, system_prompt: e.target.value})}
+                  onChange={e => setNewAgent({ ...newAgent, system_prompt: e.target.value })}
                   placeholder="You are a helpful data analyst. You have access to a database..."
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none resize-none"
                 />
@@ -394,10 +492,10 @@ export default function Agents() {
             {newAgent.agent_type !== 'custom' && (
               <div>
                 <label className="block text-sm font-medium text-zinc-400 mb-2">Advanced Config (JSON)</label>
-                <textarea 
+                <textarea
                   rows={6}
                   value={newAgent.configStr}
-                  onChange={e => setNewAgent({...newAgent, configStr: e.target.value})}
+                  onChange={e => setNewAgent({ ...newAgent, configStr: e.target.value })}
                   placeholder='{"folder_path": "/data", "max_files": 10}'
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none resize-none font-mono text-sm"
                 />
@@ -406,9 +504,9 @@ export default function Agents() {
             )}
             <div>
               <label className="block text-sm font-medium text-zinc-400 mb-2">Connected Database (Optional)</label>
-              <select 
+              <select
                 value={newAgent.db_config_id}
-                onChange={e => setNewAgent({...newAgent, db_config_id: e.target.value})}
+                onChange={e => setNewAgent({ ...newAgent, db_config_id: e.target.value })}
                 className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
               >
                 <option value="">None</option>
@@ -418,18 +516,18 @@ export default function Agents() {
               </select>
             </div>
             <div className="flex justify-end gap-3 pt-4">
-              <button 
+              <button
                 type="button"
-                onClick={() => setIsCreating(false)}
+                onClick={closeForm}
                 className="px-6 py-2.5 rounded-xl font-medium text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
               >
                 Cancel
               </button>
-              <button 
+              <button
                 type="submit"
                 className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-2.5 rounded-xl font-medium transition-colors"
               >
-                Create Agent
+                {isEditing ? 'Save Changes' : 'Create Agent'}
               </button>
             </div>
           </form>
@@ -443,19 +541,29 @@ export default function Agents() {
               <div className="p-3 bg-emerald-500/10 text-emerald-500 rounded-xl">
                 <Bot className="w-6 h-6" />
               </div>
-              <button 
-                onClick={() => deleteAgent(agent.id)}
-                className="p-2 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors"
-              >
-                <Trash2 className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => openEditForm(agent)}
+                  className="p-2 text-zinc-500 hover:text-emerald-400 hover:bg-emerald-500/10 rounded-lg transition-colors"
+                  title="Edit agent"
+                >
+                  <Pencil className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={() => deleteAgent(agent.id)}
+                  className="p-2 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors"
+                  title="Delete agent"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+              </div>
             </div>
             <h3 className="text-xl font-bold text-white mb-1">{agent.name}</h3>
             <p className="text-emerald-500 text-sm font-medium mb-3">
               {AGENT_TYPES.find(t => t.id === agent.agent_type)?.name || agent.role || 'Agent'}
             </p>
             <p className="text-zinc-400 text-sm line-clamp-3 mb-4 flex-1">
-              {agent.agent_type === 'custom' ? agent.system_prompt : (agent.config ? JSON.stringify(JSON.parse(agent.config)).substring(0, 100) + '...' : 'No config')}
+              {agent.agent_type === 'custom' ? (agent.system_prompt || 'No prompt') : previewAgentConfig(agent.config)}
             </p>
             <div className="flex flex-wrap gap-2 mt-auto">
               {agent.db_config_id && (
@@ -473,7 +581,7 @@ export default function Agents() {
             </div>
           </div>
         ))}
-        
+
         {agents.length === 0 && !isCreating && (
           <div className="col-span-full text-center py-12 text-zinc-500 border border-dashed border-zinc-800 rounded-2xl">
             <Bot className="w-12 h-12 mx-auto mb-4 opacity-50" />

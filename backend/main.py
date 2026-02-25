@@ -6,7 +6,8 @@ import os
 import tempfile
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 import uvicorn
@@ -29,10 +30,12 @@ def _default_state() -> Dict[str, Any]:
             "next_llm_config_id": 1,
             "next_db_config_id": 1,
             "next_agent_id": 1,
+            "next_thread_id": 1,
         },
         "llm_config": [],
         "db_config": [],
         "agents": [],
+        "chat_threads": [],
     }
 
 
@@ -90,7 +93,7 @@ class JsonStore:
             value = meta.get(key)
             normalized["meta"][key] = value if isinstance(value, int) and value > 0 else normalized["meta"][key]
 
-        for key in ("llm_config", "db_config", "agents"):
+        for key in ("llm_config", "db_config", "agents", "chat_threads"):
             value = state.get(key)
             normalized[key] = value if isinstance(value, list) else []
 
@@ -112,6 +115,10 @@ class JsonStore:
         normalized["meta"]["next_agent_id"] = max(
             normalized["meta"]["next_agent_id"],
             1 + max((int(item.get("id", 0)) for item in normalized["agents"]), default=0),
+        )
+        normalized["meta"]["next_thread_id"] = max(
+            normalized["meta"]["next_thread_id"],
+            1 + max((int(item.get("id", 0)) for item in normalized["chat_threads"]), default=0),
         )
 
         return normalized
@@ -156,6 +163,123 @@ def parse_agent_config(agent_row: Dict[str, Any]) -> Dict[str, Any]:
         "objectives": agent_row.get("objectives"),
         "system_prompt": agent_row.get("system_prompt"),
     }
+
+
+def build_agent_record(payload: Dict[str, Any], agent_id: int) -> Dict[str, Any]:
+    db_config_id = payload.get("db_config_id")
+    return {
+        "id": agent_id,
+        "name": payload.get("name"),
+        "role": payload.get("role"),
+        "objectives": payload.get("objectives"),
+        "persona": payload.get("persona"),
+        "tools": payload.get("tools"),
+        "memory_settings": payload.get("memory_settings"),
+        "system_prompt": payload.get("system_prompt") or "",
+        "db_config_id": int(db_config_id) if db_config_id not in (None, "") else None,
+        "agent_type": payload.get("agent_type") or "custom",
+        "config": json.dumps(payload.get("config")) if payload.get("config") is not None else None,
+    }
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_thread_record(payload: Dict[str, Any], thread_id: int) -> Dict[str, Any]:
+    now = _now_iso()
+    raw_title = str(payload.get("title") or "").strip()
+    return {
+        "id": thread_id,
+        "agent_id": _safe_int(payload.get("agent_id")),
+        "title": raw_title or f"Discussion {thread_id}",
+        "created_at": now,
+        "updated_at": now,
+        "messages": [],
+    }
+
+
+def summarize_thread(thread: Dict[str, Any]) -> Dict[str, Any]:
+    messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+    last_message = messages[-1] if messages else {}
+    preview = str(last_message.get("content") or "").replace("\n", " ").strip()
+    if len(preview) > 120:
+        preview = f"{preview[:120]}..."
+    return {
+        "id": thread.get("id"),
+        "agent_id": thread.get("agent_id"),
+        "title": thread.get("title") or f"Discussion {thread.get('id')}",
+        "created_at": thread.get("created_at"),
+        "updated_at": thread.get("updated_at"),
+        "message_count": len(messages),
+        "last_message_preview": preview,
+    }
+
+
+def _format_memory_context(messages: List[Dict[str, Any]], max_messages: int = 16) -> str:
+    if not messages:
+        return ""
+
+    selected = messages[-max_messages:]
+    lines: List[str] = ["Conversation memory (most recent first):"]
+    for message in selected:
+        role = str(message.get("role") or "user").upper()
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"- {role}: {content}")
+
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
+def _find_thread(state: Dict[str, Any], thread_id: int) -> Optional[Dict[str, Any]]:
+    return next((item for item in state["chat_threads"] if int(item.get("id", 0)) == thread_id), None)
+
+
+def _append_message(thread: Dict[str, Any], role: str, content: str, details: Any = None) -> None:
+    now = _now_iso()
+    messages = thread.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+        thread["messages"] = messages
+
+    message_record: Dict[str, Any] = {
+        "role": role,
+        "content": content,
+        "created_at": now,
+    }
+    if details is not None:
+        message_record["details"] = details
+    messages.append(message_record)
+    thread["updated_at"] = now
+
+
+def _auto_title_thread_if_needed(thread: Dict[str, Any], user_message: str) -> None:
+    current_title = str(thread.get("title") or "").strip()
+    default_prefixes = ("discussion ", "new discussion", "nouvelle discussion")
+    should_replace = (
+        not current_title
+        or any(current_title.lower().startswith(prefix) for prefix in default_prefixes)
+    )
+
+    if not should_replace:
+        return
+
+    normalized = " ".join(user_message.strip().split())
+    if not normalized:
+        return
+
+    max_len = 72
+    thread["title"] = normalized if len(normalized) <= max_len else f"{normalized[:max_len].rstrip()}..."
 
 
 def build_llm(llm_config: Dict[str, Any]) -> Any:
@@ -301,24 +425,30 @@ async def create_agent(request: Request) -> JSONResponse:
     try:
         def mutate(state: Dict[str, Any]) -> None:
             agent_id = _next_id(state, "next_agent_id")
-            db_config_id = payload.get("db_config_id")
-            state["agents"].append(
-                {
-                    "id": agent_id,
-                    "name": payload.get("name"),
-                    "role": payload.get("role"),
-                    "objectives": payload.get("objectives"),
-                    "persona": payload.get("persona"),
-                    "tools": payload.get("tools"),
-                    "memory_settings": payload.get("memory_settings"),
-                    "system_prompt": payload.get("system_prompt") or "",
-                    "db_config_id": int(db_config_id) if db_config_id not in (None, "") else None,
-                    "agent_type": payload.get("agent_type") or "custom",
-                    "config": json.dumps(payload.get("config")) if payload.get("config") is not None else None,
-                }
-            )
+            state["agents"].append(build_agent_record(payload, agent_id))
 
         store.mutate(mutate)
+        return JSONResponse(content={"success": True})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.put("/api/agents/{agent_id}")
+async def update_agent(agent_id: int, request: Request) -> JSONResponse:
+    payload = await request.json()
+
+    try:
+        def mutate(state: Dict[str, Any]) -> bool:
+            for index, item in enumerate(state["agents"]):
+                if int(item.get("id", 0)) == agent_id:
+                    state["agents"][index] = build_agent_record(payload, agent_id)
+                    return True
+            return False
+
+        updated = store.mutate(mutate)
+        if not updated:
+            return JSONResponse(status_code=404, content={"error": "Agent not found"})
+
         return JSONResponse(content={"success": True})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -328,6 +458,55 @@ async def create_agent(request: Request) -> JSONResponse:
 async def delete_agent(agent_id: int) -> JSONResponse:
     def mutate(state: Dict[str, Any]) -> None:
         state["agents"] = [item for item in state["agents"] if int(item.get("id", 0)) != agent_id]
+        state["chat_threads"] = [item for item in state["chat_threads"] if int(item.get("agent_id") or -1) != agent_id]
+
+    store.mutate(mutate)
+    return JSONResponse(content={"success": True})
+
+
+@app.get("/api/chat/threads")
+async def get_chat_threads(agent_id: Optional[int] = None) -> JSONResponse:
+    state = store.read()
+    threads = state.get("chat_threads", [])
+
+    if agent_id is not None:
+        threads = [thread for thread in threads if int(thread.get("agent_id") or 0) == agent_id]
+
+    summaries = [summarize_thread(thread) for thread in threads]
+    summaries.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return JSONResponse(content=summaries)
+
+
+@app.post("/api/chat/threads")
+async def create_chat_thread(request: Request) -> JSONResponse:
+    payload = await request.json()
+
+    try:
+        def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
+            thread_id = _next_id(state, "next_thread_id")
+            thread = build_thread_record(payload, thread_id)
+            state["chat_threads"].append(thread)
+            return thread
+
+        created = store.mutate(mutate)
+        return JSONResponse(content=created)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/api/chat/threads/{thread_id}")
+async def get_chat_thread(thread_id: int) -> JSONResponse:
+    state = store.read()
+    thread = _find_thread(state, thread_id)
+    if not thread:
+        return JSONResponse(status_code=404, content={"error": "Thread not found"})
+    return JSONResponse(content=thread)
+
+
+@app.delete("/api/chat/threads/{thread_id}")
+async def delete_chat_thread(thread_id: int) -> JSONResponse:
+    def mutate(state: Dict[str, Any]) -> None:
+        state["chat_threads"] = [item for item in state["chat_threads"] if int(item.get("id", 0)) != thread_id]
 
     store.mutate(mutate)
     return JSONResponse(content={"success": True})
@@ -336,9 +515,13 @@ async def delete_agent(agent_id: int) -> JSONResponse:
 @app.post("/api/chat/{agent_id}")
 async def chat_agent(agent_id: int, request: Request):
     payload = await request.json()
-    message = payload.get("message")
-    thread_id = payload.get("threadId")
+    message = str(payload.get("message") or "").strip()
+    requested_thread_id = _safe_int(payload.get("threadId"))
+    requested_thread_title = str(payload.get("threadTitle") or "").strip()
     is_streaming = request.query_params.get("stream") == "true"
+
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "Message is required"})
 
     try:
         state = store.read()
@@ -352,6 +535,53 @@ async def chat_agent(agent_id: int, request: Request):
 
         llm = build_llm(llm_config)
         full_config = parse_agent_config(agent)
+        agent_name = agent.get("name") or agent.get("agent_type") or "agent"
+
+        try:
+            def mutate_user_message(state_mut: Dict[str, Any]) -> Dict[str, Any]:
+                thread = _find_thread(state_mut, requested_thread_id) if requested_thread_id is not None else None
+
+                if thread is None:
+                    new_thread_id = _next_id(state_mut, "next_thread_id")
+                    thread = build_thread_record(
+                        {
+                            "agent_id": agent_id,
+                            "title": requested_thread_title or f"Discussion {new_thread_id}",
+                        },
+                        new_thread_id,
+                    )
+                    state_mut["chat_threads"].append(thread)
+
+                thread_agent_id = _safe_int(thread.get("agent_id"))
+                if thread_agent_id is None:
+                    thread["agent_id"] = agent_id
+                elif thread_agent_id != agent_id:
+                    raise ValueError("Thread belongs to another agent")
+
+                _auto_title_thread_if_needed(thread, message)
+                _append_message(thread, "user", message)
+
+                messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+                return {"thread_id": int(thread.get("id")), "messages": messages}
+
+            thread_write_result = store.mutate(mutate_user_message)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        resolved_thread_id = int(thread_write_result["thread_id"])
+        all_messages = thread_write_result.get("messages") if isinstance(thread_write_result.get("messages"), list) else []
+        previous_messages = all_messages[:-1] if len(all_messages) > 0 else []
+        memory_context = _format_memory_context(previous_messages)
+        execution_input = f"{memory_context}\n\nCurrent user message:\n{message}" if memory_context else message
+
+        def persist_assistant_message(content: str, details: Any = None) -> None:
+            def mutate_assistant_message(state_mut: Dict[str, Any]) -> None:
+                thread = _find_thread(state_mut, resolved_thread_id)
+                if not thread:
+                    return
+                _append_message(thread, "assistant", content, details)
+
+            store.mutate(mutate_assistant_message)
 
         if agent.get("agent_type") == "manager":
             all_agents = [a for a in state["agents"] if a.get("agent_type") != "manager"]
@@ -365,20 +595,30 @@ async def chat_agent(agent_id: int, request: Request):
                 async def worker() -> None:
                     try:
                         result = await MultiAgentManager.run_stream(
-                            message,
+                            execution_input,
                             all_agents,
                             llm,
                             full_config,
                             on_step=on_step,
                         )
+                        response_text = str(result.get("answer") or "")
+                        persist_assistant_message(
+                            response_text,
+                            {
+                                "steps": result.get("steps"),
+                                "agent_type": "manager",
+                            },
+                        )
                         await queue.put(
                             {
                                 "type": "result",
-                                "response": result.get("answer"),
+                                "response": response_text,
                                 "steps": result.get("steps"),
+                                "threadId": resolved_thread_id,
                             }
                         )
                     except Exception as exc:
+                        persist_assistant_message(f"Error: {exc}")
                         await queue.put({"type": "error", "error": str(exc)})
                     finally:
                         await queue.put({"_done": True})
@@ -400,23 +640,65 @@ async def chat_agent(agent_id: int, request: Request):
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
 
-            result = await MultiAgentManager.run_stream(message, all_agents, llm, full_config)
+            result = await MultiAgentManager.run_stream(execution_input, all_agents, llm, full_config)
+            response_text = str(result.get("answer") or "")
+            persist_assistant_message(
+                response_text,
+                {
+                    "steps": result.get("steps"),
+                    "agent_type": "manager",
+                },
+            )
             return JSONResponse(
                 content={
-                    "response": result.get("answer"),
+                    "response": response_text,
                     "steps": result.get("steps"),
-                    "threadId": thread_id or "default",
+                    "threadId": resolved_thread_id,
                 }
             )
 
         if is_streaming:
-            async def event_stream():
+            queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+            def on_step(step: Dict[str, Any]) -> None:
+                queue.put_nowait({"type": "step", "step": step})
+
+            async def worker() -> None:
                 try:
-                    result = await AgentExecutor.execute(agent.get("agent_type") or "custom", full_config, message, llm)
-                    stream_payload = {"type": "result", "response": result.get("answer"), "details": result}
+                    result = await AgentExecutor.execute(
+                        agent.get("agent_type") or "custom",
+                        full_config,
+                        execution_input,
+                        llm,
+                        on_step=on_step,
+                        agent_name=agent_name,
+                    )
+                    response_text = str(result.get("answer") or "")
+                    persist_assistant_message(response_text, result)
+                    await queue.put(
+                        {
+                            "type": "result",
+                            "response": response_text,
+                            "details": result,
+                            "threadId": resolved_thread_id,
+                        }
+                    )
                 except Exception as exc:
-                    stream_payload = {"type": "error", "error": str(exc)}
-                yield f"data: {json.dumps(stream_payload, ensure_ascii=False)}\\n\\n"
+                    persist_assistant_message(f"Error: {exc}")
+                    await queue.put({"type": "error", "error": str(exc)})
+                finally:
+                    await queue.put({"_done": True})
+
+            async def event_stream():
+                task = asyncio.create_task(worker())
+                try:
+                    while True:
+                        event = await queue.get()
+                        if event.get("_done"):
+                            break
+                        yield f"data: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+                finally:
+                    await task
 
             return StreamingResponse(
                 event_stream(),
@@ -424,12 +706,20 @@ async def chat_agent(agent_id: int, request: Request):
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        result = await AgentExecutor.execute(agent.get("agent_type") or "custom", full_config, message, llm)
+        result = await AgentExecutor.execute(
+            agent.get("agent_type") or "custom",
+            full_config,
+            execution_input,
+            llm,
+            agent_name=agent_name,
+        )
+        response_text = str(result.get("answer") or "")
+        persist_assistant_message(response_text, result)
         return JSONResponse(
             content={
-                "response": result.get("answer"),
+                "response": response_text,
                 "details": result,
-                "threadId": thread_id or "default",
+                "threadId": resolved_thread_id,
             }
         )
 
