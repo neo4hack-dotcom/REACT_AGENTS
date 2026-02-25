@@ -780,6 +780,10 @@ def _fetch_url_with_fallback(
     allow_reader_proxy_fallback: bool = True,
 ) -> tuple[requests.Response | None, List[str]]:
     raw_url = str(url or "").strip()
+    if raw_url and "://" not in raw_url:
+        bare_url = raw_url.lstrip(".,;:")
+        if re.match(r"^(?:www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:[/?#].*)?$", bare_url):
+            raw_url = f"https://{bare_url}"
     parsed = urlparse(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None, [f"{raw_url} -> invalid_url"]
