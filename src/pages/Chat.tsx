@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Bot, User, Loader2, ChevronDown, ChevronUp, Plus, MessageSquare, Trash2, RotateCcw } from 'lucide-react';
+import { Send, Bot, User, Loader2, ChevronDown, ChevronUp, Plus, MessageSquare, Trash2, RotateCcw, Activity } from 'lucide-react';
 import Markdown from 'react-markdown';
 
 type ChatMessage = {
@@ -16,8 +16,12 @@ type ChatThreadSummary = {
   agent_id: number | null;
   title: string;
   updated_at?: string;
+  created_at?: string;
   message_count?: number;
   last_message_preview?: string;
+  is_processing?: boolean;
+  processing_started_at?: string | null;
+  active_run_id?: string | null;
 };
 
 type ChatThread = {
@@ -26,11 +30,28 @@ type ChatThread = {
   title: string;
   created_at?: string;
   updated_at?: string;
+  is_processing?: boolean;
+  processing_started_at?: string | null;
+  active_run_id?: string | null;
   messages?: Array<{
     role: string;
     content: string;
     details?: any;
   }>;
+};
+
+type ChatRunStatus = {
+  run_id: string;
+  thread_id: number;
+  agent_id: number;
+  agent_name?: string;
+  status: 'running' | 'completed' | 'failed';
+  started_at?: string;
+  updated_at?: string;
+  finished_at?: string | null;
+  response?: string | null;
+  error?: string | null;
+  steps?: any[];
 };
 
 export default function Chat() {
@@ -42,20 +63,50 @@ export default function Chat() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [activeAssistantMessageId, setActiveAssistantMessageId] = useState<string | null>(null);
+  const [showLiveDetails, setShowLiveDetails] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const runPollRef = useRef<{ runId: string; threadId: number; messageId: string; cancelled: boolean } | null>(null);
+  const selectedThreadIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     bootstrap();
   }, []);
 
   useEffect(() => {
+    selectedThreadIdRef.current = selectedThreadId;
+  }, [selectedThreadId]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    const hasProcessingThread = threads.some(thread => Boolean(thread.is_processing && thread.active_run_id));
+    if (!hasProcessingThread) return;
+
+    const timer = window.setInterval(() => {
+      void fetchThreads();
+    }, 3000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [threads]);
+
+  useEffect(() => {
+    return () => {
+      if (runPollRef.current) {
+        runPollRef.current.cancelled = true;
+        runPollRef.current = null;
+      }
+    };
+  }, []);
 
   const selectedThread = useMemo(
     () => threads.find(thread => thread.id === selectedThreadId) || null,
     [threads, selectedThreadId]
   );
+  const selectedThreadIsProcessing = Boolean(selectedThread?.is_processing && selectedThread?.active_run_id);
   const activeAssistantMessage = useMemo(
     () => messages.find(message => message.local_id === activeAssistantMessageId) || null,
     [messages, activeAssistantMessageId]
@@ -140,7 +191,7 @@ export default function Chat() {
         content: String(msg?.content || ''),
         details,
         steps,
-        showDetails: false,
+        showDetails: showLiveDetails,
       };
     });
   };
@@ -167,6 +218,14 @@ export default function Chat() {
 
   const fetchThreadDetail = async (threadId: number): Promise<ChatThread | null> => {
     const res = await fetch(`/api/chat/threads/${threadId}`);
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  };
+
+  const fetchRunStatus = async (runId: string): Promise<ChatRunStatus | null> => {
+    const res = await fetch(`/api/chat/runs/${runId}`);
     if (!res.ok) {
       return null;
     }
@@ -256,6 +315,10 @@ export default function Chat() {
       agent_id: created.agent_id ?? parseInt(agentId, 10),
       title: created.title || `Discussion ${created.id}`,
       updated_at: created.updated_at,
+      created_at: created.created_at,
+      is_processing: false,
+      processing_started_at: null,
+      active_run_id: null,
       message_count: 0,
       last_message_preview: '',
     };
@@ -276,7 +339,6 @@ export default function Chat() {
   };
 
   const openThread = async (threadId: number) => {
-    if (isLoading) return;
     setSelectedThreadId(threadId);
 
     const summary = threads.find(thread => thread.id === threadId);
@@ -303,6 +365,10 @@ export default function Chat() {
   const clearThread = async (threadId: number) => {
     if (isLoading) return;
     const thread = threads.find(item => item.id === threadId);
+    if (thread?.is_processing) {
+      alert('This discussion is currently running. Wait until completion before clearing it.');
+      return;
+    }
     const threadLabel = thread?.title || `Discussion ${threadId}`;
     const confirmed = window.confirm(`Clear all messages in "${threadLabel}"?`);
     if (!confirmed) return;
@@ -328,6 +394,10 @@ export default function Chat() {
   const deleteThread = async (threadId: number) => {
     if (isLoading) return;
     const thread = threads.find(item => item.id === threadId);
+    if (thread?.is_processing) {
+      alert('This discussion is currently running. Wait until completion before deleting it.');
+      return;
+    }
     const threadLabel = thread?.title || `Discussion ${threadId}`;
     const confirmed = window.confirm(`Delete "${threadLabel}" permanently?`);
     if (!confirmed) return;
@@ -382,6 +452,20 @@ export default function Chat() {
     });
   };
 
+  const toggleGlobalDetails = () => {
+    setShowLiveDetails(prev => {
+      const next = !prev;
+      setMessages(items => (
+        items.map(message => (
+          message.role === 'assistant'
+            ? { ...message, showDetails: next }
+            : message
+        ))
+      ));
+      return next;
+    });
+  };
+
   const summarizeLiveStep = (step: any): string => {
     const message = String(step?.message || '').trim();
     if (message) return message;
@@ -405,11 +489,177 @@ export default function Chat() {
     return '';
   };
 
+  const renderManagerLiveTrace = (steps: any[] | undefined): string => {
+    if (!Array.isArray(steps) || steps.length === 0) return '';
+    const lines: string[] = [];
+    const clip = (value: string, max = 240) => {
+      const text = String(value || '').trim();
+      return text.length > max ? `${text.slice(0, max)}...` : text;
+    };
+
+    for (const step of steps) {
+      const status = String(step?.status || '');
+      if (status === 'agent_call_started') {
+        const agentName = String(step?.agent || 'Agent');
+        const input = clip(String(step?.input || ''), 260);
+        lines.push(`- **Call** \`${agentName}\`${input ? ` | input: ${input}` : ''}`);
+      } else if (status === 'agent_call_completed') {
+        const agentName = String(step?.agent || 'Agent');
+        const resultAnswer = clip(String(step?.result?.answer || ''), 280);
+        lines.push(`- **Response** \`${agentName}\`${resultAnswer ? ` | ${resultAnswer}` : ''}`);
+      } else if (status === 'agent_call_failed') {
+        const agentName = String(step?.agent || 'Agent');
+        const error = clip(String(step?.error || ''), 240);
+        lines.push(`- **Failure** \`${agentName}\`${error ? ` | ${error}` : ''}`);
+      } else if (status === 'manager_decision') {
+        const plan = clip(String(step?.plan || ''), 280);
+        const rationale = clip(String(step?.rationale || ''), 260);
+        if (plan) {
+          lines.push(`- **Plan** ${plan}`);
+        } else if (rationale) {
+          lines.push(`- **Reasoning** ${rationale}`);
+        }
+      }
+    }
+
+    if (lines.length === 0) return '';
+    return `**Manager actions (live)**\n${lines.join('\n')}`;
+  };
+
+  const stopRunPolling = () => {
+    if (runPollRef.current) {
+      runPollRef.current.cancelled = true;
+      runPollRef.current = null;
+    }
+  };
+
+  const upsertLiveRunMessage = (run: ChatRunStatus, messageId: string) => {
+    setMessages(prev => {
+      const next = [...prev];
+      const idx = next.findIndex(item => item.local_id === messageId);
+      const current = idx >= 0
+        ? { ...next[idx] }
+        : {
+            local_id: messageId,
+            role: 'assistant' as const,
+            content: 'Agent is thinking...',
+            steps: [],
+            showDetails: true,
+          };
+
+      const liveSteps = Array.isArray(run.steps) ? run.steps : [];
+      if (liveSteps.length > 0) {
+        current.steps = liveSteps;
+        if (showLiveDetails) {
+          current.showDetails = true;
+        }
+      }
+
+      const managerTrace = renderManagerLiveTrace(liveSteps);
+
+      if (run.status === 'failed') {
+        current.content = `Error: ${run.error || 'Execution failed.'}`;
+      } else if (run.status === 'completed') {
+        current.content = String(run.response || deriveFallbackAnswerFromSteps(liveSteps) || 'Execution completed.');
+        if (managerTrace) {
+          current.content = `${managerTrace}\n\n${current.content}`;
+        }
+      } else {
+        const latestStep = liveSteps.length > 0 ? liveSteps[liveSteps.length - 1] : null;
+        const liveSummary = latestStep ? summarizeLiveStep(latestStep) : 'Agent is thinking...';
+        current.content = managerTrace || liveSummary;
+      }
+
+      if (idx >= 0) {
+        next[idx] = current;
+      } else {
+        next.push(current);
+      }
+      return next;
+    });
+  };
+
+  const startRunPolling = (runId: string, threadId: number, messageId?: string) => {
+    if (!runId) return;
+    if (runPollRef.current?.runId === runId && !runPollRef.current.cancelled) {
+      return;
+    }
+
+    stopRunPolling();
+    const fallbackMessageId = messageId || `run-live-${runId}`;
+    const pollState = { runId, threadId, messageId: fallbackMessageId, cancelled: false };
+    runPollRef.current = pollState;
+    setIsLoading(true);
+    setActiveAssistantMessageId(fallbackMessageId);
+
+    const tick = async () => {
+      if (pollState.cancelled) return;
+
+      try {
+        const run = await fetchRunStatus(runId);
+        if (!run) {
+          await refreshThreads(threadId);
+          if (selectedThreadIdRef.current === threadId) {
+            await syncActiveThreadMessages(threadId);
+          }
+          setIsLoading(false);
+          setActiveAssistantMessageId(null);
+          if (runPollRef.current === pollState) {
+            runPollRef.current = null;
+          }
+          return;
+        }
+
+        if (selectedThreadIdRef.current === threadId) {
+          upsertLiveRunMessage(run, fallbackMessageId);
+        }
+
+        if (run.status === 'running') {
+          window.setTimeout(tick, 900);
+          return;
+        }
+
+        await refreshThreads(threadId);
+        if (selectedThreadIdRef.current === threadId) {
+          await syncActiveThreadMessages(threadId);
+        }
+        setIsLoading(false);
+        setActiveAssistantMessageId(null);
+        if (runPollRef.current === pollState) {
+          runPollRef.current = null;
+        }
+      } catch (e) {
+        console.error('Failed to poll run status', e);
+        if (!pollState.cancelled) {
+          window.setTimeout(tick, 1500);
+        }
+      }
+    };
+
+    void tick();
+  };
+
+  useEffect(() => {
+    const runId = selectedThread?.active_run_id;
+    const shouldResume = Boolean(selectedThreadId && selectedThread?.is_processing && runId);
+
+    if (!shouldResume) {
+      stopRunPolling();
+      setIsLoading(false);
+      setActiveAssistantMessageId(null);
+      return;
+    }
+
+    if (runId) {
+      startRunPolling(runId, selectedThreadId!, runPollRef.current?.messageId);
+    }
+  }, [selectedThreadId, selectedThread?.is_processing, selectedThread?.active_run_id]);
+
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     const threadBoundAgentId = selectedThread?.agent_id ? String(selectedThread.agent_id) : '';
     const agentIdForChat = threadBoundAgentId || selectedAgentId;
-    if (!input.trim() || !agentIdForChat) return;
+    if (!input.trim() || !agentIdForChat || selectedThreadIsProcessing) return;
 
     const userMsg = input.trim();
     setInput('');
@@ -430,17 +680,23 @@ export default function Chat() {
     }
 
     const userMessageId = createLocalMessageId('user');
-    const assistantMessageId = createLocalMessageId('assistant');
+    const assistantMessageId = createLocalMessageId('assistant-live');
     setMessages(prev => [
       ...prev,
       { local_id: userMessageId, role: 'user', content: userMsg },
-      { local_id: assistantMessageId, role: 'assistant', content: 'Preparing execution...', steps: [], showDetails: true },
+      {
+        local_id: assistantMessageId,
+        role: 'assistant',
+        content: 'Preparing execution...',
+        steps: [],
+        showDetails: showLiveDetails,
+      },
     ]);
     setActiveAssistantMessageId(assistantMessageId);
     setIsLoading(true);
 
     try {
-      const res = await fetch(`/api/chat/${agentIdForChat}?stream=true`, {
+      const res = await fetch(`/api/chat/${agentIdForChat}/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: userMsg, threadId: activeThreadId }),
@@ -458,72 +714,31 @@ export default function Chat() {
         return;
       }
 
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let responseThreadId = activeThreadId;
-
-      if (reader) {
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const events = buffer.split(/\r?\n\r?\n/);
-          buffer = events.pop() || '';
-
-          for (const rawEvent of events) {
-            const lines = rawEvent.split(/\r?\n/).filter(line => line.trim() !== '');
-            for (const line of lines) {
-              if (!line.startsWith('data:')) continue;
-
-              try {
-                const data = JSON.parse(line.slice(5).trimStart());
-
-                if (typeof data.threadId === 'number') {
-                  responseThreadId = data.threadId;
-                }
-
-                setMessages(prev => {
-                  const next = [...prev];
-                  const targetIndex = next.findIndex(message => message.local_id === assistantMessageId);
-                  if (targetIndex < 0) return next;
-
-                  const current = { ...next[targetIndex] };
-
-                  if (data.type === 'step') {
-                    current.steps = [...(current.steps || []), data.step];
-                    current.showDetails = true;
-                    if (!current.content || current.content.startsWith('Preparing execution') || current.content.startsWith('Execution:')) {
-                      current.content = summarizeLiveStep(data.step);
-                    }
-                  } else if (data.type === 'result') {
-                    const fallbackFromSteps = deriveFallbackAnswerFromSteps(data.steps);
-                    current.content = data.response || fallbackFromSteps || current.content || 'Le manager a terminé sans réponse finale explicite.';
-                    current.details = data.details;
-                    if (Array.isArray(data.steps)) {
-                      current.steps = data.steps;
-                    }
-                  } else if (data.type === 'error') {
-                    current.content = `Error: ${data.error}`;
-                  }
-
-                  next[targetIndex] = current;
-                  return next;
-                });
-              } catch (parseErr) {
-                console.error('Error parsing SSE data', parseErr, line);
-              }
-            }
-          }
-        }
+      const data = await res.json();
+      const responseThreadId = typeof data.threadId === 'number' ? data.threadId : activeThreadId;
+      const runId = String(data.runId || '');
+      if (!runId) {
+        throw new Error('Missing run id from server');
       }
 
-      if (responseThreadId !== selectedThreadId) {
+      setThreads(prev => prev.map(thread => (
+        thread.id === responseThreadId
+          ? {
+              ...thread,
+              is_processing: true,
+              active_run_id: runId,
+              processing_started_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            }
+          : thread
+      )));
+
+      if (responseThreadId !== selectedThreadIdRef.current) {
         setSelectedThreadId(responseThreadId);
       }
+
       await refreshThreads(responseThreadId);
-      await syncActiveThreadMessages(responseThreadId);
+      startRunPolling(runId, responseThreadId, assistantMessageId);
     } catch (e: any) {
       setMessages(prev => {
         return prev.map(message => (
@@ -532,9 +747,10 @@ export default function Chat() {
             : message
         ));
       });
-    } finally {
       setIsLoading(false);
       setActiveAssistantMessageId(null);
+    } finally {
+      // Loading state is cleared by run polling when execution is finished.
     }
   };
 
@@ -584,10 +800,17 @@ export default function Chat() {
                 >
                   <button
                     onClick={() => openThread(thread.id)}
-                    disabled={isLoading}
-                    className="flex-1 text-left rounded-lg px-3 py-2.5 disabled:opacity-50"
+                    className="flex-1 text-left rounded-lg px-3 py-2.5"
                   >
-                    <p className="text-sm font-semibold text-slate-900 truncate">{thread.title || `Discussion ${thread.id}`}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold text-slate-900 truncate">{thread.title || `Discussion ${thread.id}`}</p>
+                      {thread.is_processing && thread.active_run_id && (
+                        <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+                          <Activity className="mr-1 h-3 w-3 animate-pulse" />
+                          active
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-slate-500 mt-0.5 line-clamp-2">
                       {thread.last_message_preview || 'Empty conversation'}
                     </p>
@@ -625,15 +848,36 @@ export default function Chat() {
             </div>
             <div>
               <h1 className="text-xl font-bold text-slate-900">Agent Chat</h1>
-              <p className="text-xs text-slate-500">
-                {selectedThread ? selectedThread.title : 'No discussion selected'}
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs text-slate-500">
+                  {selectedThread ? selectedThread.title : 'No discussion selected'}
+                </p>
+                {selectedThread?.is_processing && selectedThread?.active_run_id && (
+                  <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+                    <Activity className="mr-1 h-3 w-3 animate-pulse" />
+                    agent actif
+                  </span>
+                )}
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              disabled={!selectedThreadId || isLoading}
+              disabled={messages.length === 0}
+              onClick={toggleGlobalDetails}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                showLiveDetails
+                  ? 'border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100'
+                  : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+              } disabled:opacity-40 disabled:cursor-not-allowed`}
+              title="Afficher/Masquer les détails en direct"
+            >
+              {showLiveDetails ? 'Masquer détails' : 'Détail'}
+            </button>
+            <button
+              type="button"
+              disabled={!selectedThreadId || isLoading || selectedThreadIsProcessing}
               onClick={async () => {
                 if (!selectedThreadId) return;
                 try {
@@ -650,7 +894,7 @@ export default function Chat() {
             </button>
             <button
               type="button"
-              disabled={!selectedThreadId || isLoading}
+              disabled={!selectedThreadId || isLoading || selectedThreadIsProcessing}
               onClick={async () => {
                 if (!selectedThreadId) return;
                 try {
@@ -792,12 +1036,12 @@ export default function Chat() {
               value={input}
               onChange={e => setInput(e.target.value)}
               placeholder={selectedThreadId ? 'Ask your agent something...' : 'Start by creating/selecting a discussion...'}
-              disabled={isLoading || !selectedAgentId}
+              disabled={isLoading || !selectedAgentId || selectedThreadIsProcessing}
               className="w-full bg-white border border-slate-300 rounded-full pl-6 pr-14 py-4 text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-sky-500 focus:border-transparent outline-none disabled:opacity-50 shadow-sm"
             />
             <button
               type="submit"
-              disabled={isLoading || !input.trim() || !selectedAgentId}
+              disabled={isLoading || !input.trim() || !selectedAgentId || selectedThreadIsProcessing}
               className="absolute right-2 p-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-full transition-colors disabled:opacity-50 disabled:hover:bg-slate-900"
             >
               <Send className="w-5 h-5" />

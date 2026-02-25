@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Bot, Plus, Trash2, Database, Settings, Pencil, Download, Upload } from 'lucide-react';
+import { Bot, Plus, Trash2, Database, Settings, Pencil, Download, Upload, ArrowUp, ArrowDown } from 'lucide-react';
 
 const AGENT_TYPES = [
   { id: 'custom', name: 'Custom Agent' },
@@ -259,6 +259,7 @@ export default function Agents() {
   const [isCreating, setIsCreating] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
   const [newAgent, setNewAgent] = useState<AgentFormState>(buildDefaultAgentState());
+  const [isReordering, setIsReordering] = useState(false);
   const importFileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -483,6 +484,45 @@ export default function Agents() {
     }
   };
 
+  const moveAgent = async (agentId: number, direction: 'up' | 'down') => {
+    if (isReordering) return;
+
+    let nextOrder: any[] = [];
+    setAgents(prev => {
+      const index = prev.findIndex(agent => agent.id === agentId);
+      if (index < 0) return prev;
+
+      const target = direction === 'up' ? index - 1 : index + 1;
+      if (target < 0 || target >= prev.length) return prev;
+
+      const copy = [...prev];
+      const [item] = copy.splice(index, 1);
+      copy.splice(target, 0, item);
+      nextOrder = copy;
+      return copy;
+    });
+
+    if (nextOrder.length === 0) return;
+
+    setIsReordering(true);
+    try {
+      const res = await fetch('/api/agents/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ordered_ids: nextOrder.map(agent => agent.id) }),
+      });
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+      await fetchAgents();
+    } catch (e: any) {
+      alert(`Failed to reorder agents: ${e.message}`);
+      await fetchAgents();
+    } finally {
+      setIsReordering(false);
+    }
+  };
+
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-8">
       <div className="flex items-center justify-between">
@@ -683,7 +723,7 @@ export default function Agents() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {agents.map(agent => {
+        {agents.map((agent, index) => {
           const isManager = agent.agent_type === 'manager';
           const typeLabel = AGENT_TYPES.find(t => t.id === agent.agent_type)?.name || agent.role || 'Agent';
           const cardPreview = isManager
@@ -704,6 +744,30 @@ export default function Agents() {
                   <Bot className="w-6 h-6" />
                 </div>
                 <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => moveAgent(agent.id, 'up')}
+                    disabled={isReordering || index === 0}
+                    className={`p-2 rounded-lg transition-colors ${
+                      isManager
+                        ? 'text-amber-200/70 hover:text-amber-100 hover:bg-amber-500/15'
+                        : 'text-zinc-500 hover:text-sky-300 hover:bg-sky-500/10'
+                    } disabled:opacity-35 disabled:cursor-not-allowed`}
+                    title="Move up"
+                  >
+                    <ArrowUp className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => moveAgent(agent.id, 'down')}
+                    disabled={isReordering || index === agents.length - 1}
+                    className={`p-2 rounded-lg transition-colors ${
+                      isManager
+                        ? 'text-amber-200/70 hover:text-amber-100 hover:bg-amber-500/15'
+                        : 'text-zinc-500 hover:text-sky-300 hover:bg-sky-500/10'
+                    } disabled:opacity-35 disabled:cursor-not-allowed`}
+                    title="Move down"
+                  >
+                    <ArrowDown className="w-4 h-4" />
+                  </button>
                   <button
                     onClick={() => openEditForm(agent)}
                     className={`p-2 rounded-lg transition-colors ${

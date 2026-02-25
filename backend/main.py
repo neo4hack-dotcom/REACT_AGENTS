@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from threading import RLock
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from backend.agents import AgentExecutor, MultiAgentManager
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT_DIR / "dist"
 DB_JSON_PATH = Path(os.getenv("DB_JSON_PATH", str(ROOT_DIR / "DB.json"))).resolve()
+CHAT_RUN_RETENTION_SECONDS = int(os.getenv("CHAT_RUN_RETENTION_SECONDS", "3600"))
 
 
 def _default_state() -> Dict[str, Any]:
@@ -143,6 +145,89 @@ def _next_id(state: Dict[str, Any], key: str) -> int:
 
 store = JsonStore(DB_JSON_PATH)
 app = FastAPI(title="AI Data Agents Backend", version="2.2.0")
+chat_runs_lock = RLock()
+chat_runs: Dict[str, Dict[str, Any]] = {}
+
+
+def _cleanup_chat_runs_unlocked(now_ts: float | None = None) -> None:
+    ts = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
+    expired: List[str] = []
+    for run_id, record in chat_runs.items():
+        finished_ts = float(record.get("finished_ts") or 0)
+        status = str(record.get("status") or "")
+        if status in {"completed", "failed"} and finished_ts > 0:
+            if ts - finished_ts >= CHAT_RUN_RETENTION_SECONDS:
+                expired.append(run_id)
+    for run_id in expired:
+        chat_runs.pop(run_id, None)
+
+
+def _create_chat_run(run_id: str, thread_id: int, agent_id: int, agent_name: str) -> Dict[str, Any]:
+    now_iso = _now_iso()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    record: Dict[str, Any] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "status": "running",
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "finished_at": None,
+        "started_ts": now_ts,
+        "finished_ts": None,
+        "response": None,
+        "error": None,
+        "steps": [],
+    }
+    with chat_runs_lock:
+        _cleanup_chat_runs_unlocked(now_ts)
+        chat_runs[run_id] = record
+    return record
+
+
+def _append_chat_run_step(run_id: str, step: Dict[str, Any]) -> None:
+    now_iso = _now_iso()
+    with chat_runs_lock:
+        record = chat_runs.get(run_id)
+        if not record:
+            return
+        steps = record.get("steps")
+        if not isinstance(steps, list):
+            steps = []
+            record["steps"] = steps
+        steps.append(step)
+        if len(steps) > 500:
+            record["steps"] = steps[-500:]
+        record["updated_at"] = now_iso
+
+
+def _set_chat_run_finished(run_id: str, *, status: str, response: str | None = None, error: str | None = None) -> None:
+    now_iso = _now_iso()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    with chat_runs_lock:
+        record = chat_runs.get(run_id)
+        if not record:
+            return
+        record["status"] = status
+        record["updated_at"] = now_iso
+        record["finished_at"] = now_iso
+        record["finished_ts"] = now_ts
+        if response is not None:
+            record["response"] = response
+        if error is not None:
+            record["error"] = error
+        _cleanup_chat_runs_unlocked(now_ts)
+
+
+def _get_chat_run(run_id: str) -> Optional[Dict[str, Any]]:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    with chat_runs_lock:
+        _cleanup_chat_runs_unlocked(now_ts)
+        record = chat_runs.get(run_id)
+        if not record:
+            return None
+        return dict(record)
 
 
 def parse_agent_config(agent_row: Dict[str, Any]) -> Dict[str, Any]:
@@ -243,6 +328,9 @@ def build_thread_record(payload: Dict[str, Any], thread_id: int) -> Dict[str, An
         "title": raw_title or f"Discussion {thread_id}",
         "created_at": now,
         "updated_at": now,
+        "is_processing": False,
+        "processing_started_at": None,
+        "active_run_id": None,
         "messages": [],
     }
 
@@ -259,6 +347,9 @@ def summarize_thread(thread: Dict[str, Any]) -> Dict[str, Any]:
         "title": thread.get("title") or f"Discussion {thread.get('id')}",
         "created_at": thread.get("created_at"),
         "updated_at": thread.get("updated_at"),
+        "is_processing": bool(thread.get("is_processing")),
+        "processing_started_at": thread.get("processing_started_at"),
+        "active_run_id": thread.get("active_run_id"),
         "message_count": len(messages),
         "last_message_preview": preview,
     }
@@ -304,6 +395,32 @@ def _append_message(thread: Dict[str, Any], role: str, content: str, details: An
     thread["updated_at"] = now
 
 
+def _set_thread_processing_state(
+    thread: Dict[str, Any],
+    *,
+    is_processing: bool,
+    run_id: str | None = None,
+    clear_only_if_run_matches: bool = False,
+) -> None:
+    now = _now_iso()
+    if is_processing:
+        thread["is_processing"] = True
+        thread["processing_started_at"] = now
+        thread["active_run_id"] = run_id
+        thread["updated_at"] = now
+        return
+
+    if clear_only_if_run_matches:
+        active_run = str(thread.get("active_run_id") or "")
+        if run_id and active_run and active_run != run_id:
+            return
+
+    thread["is_processing"] = False
+    thread["processing_started_at"] = None
+    thread["active_run_id"] = None
+    thread["updated_at"] = now
+
+
 def _auto_title_thread_if_needed(thread: Dict[str, Any], user_message: str) -> None:
     current_title = str(thread.get("title") or "").strip()
     default_prefixes = ("discussion ", "new discussion", "nouvelle discussion")
@@ -339,6 +456,72 @@ def build_llm(llm_config: Dict[str, Any]) -> Any:
         )
 
     raise HTTPException(status_code=400, detail="Unsupported LLM provider")
+
+
+async def _execute_chat_run_background(
+    *,
+    run_id: str,
+    thread_id: int,
+    agent: Dict[str, Any],
+    llm: Any,
+    full_config: Dict[str, Any],
+    execution_input: str,
+    agent_name: str,
+) -> None:
+    def add_step(step: Dict[str, Any]) -> None:
+        _append_chat_run_step(run_id, step)
+
+    def persist_assistant(content: str, details: Any = None, clear_processing: bool = True) -> None:
+        def mutate(state_mut: Dict[str, Any]) -> None:
+            thread = _find_thread(state_mut, thread_id)
+            if not thread:
+                return
+            _append_message(thread, "assistant", content, details)
+            if clear_processing:
+                _set_thread_processing_state(
+                    thread,
+                    is_processing=False,
+                    run_id=run_id,
+                    clear_only_if_run_matches=True,
+                )
+
+        store.mutate(mutate)
+
+    try:
+        if agent.get("agent_type") == "manager":
+            state = store.read()
+            all_agents = [a for a in state["agents"] if a.get("agent_type") != "manager"]
+            result = await MultiAgentManager.run_stream(
+                execution_input,
+                all_agents,
+                llm,
+                full_config,
+                on_step=add_step,
+            )
+            response_text = str(result.get("answer") or "")
+            details = {
+                "steps": result.get("steps"),
+                "agent_type": "manager",
+            }
+            persist_assistant(response_text, details)
+            _set_chat_run_finished(run_id, status="completed", response=response_text)
+            return
+
+        result = await AgentExecutor.execute(
+            agent.get("agent_type") or "custom",
+            full_config,
+            execution_input,
+            llm,
+            on_step=add_step,
+            agent_name=agent_name,
+        )
+        response_text = str(result.get("answer") or "")
+        persist_assistant(response_text, result)
+        _set_chat_run_finished(run_id, status="completed", response=response_text)
+    except Exception as exc:
+        error_text = str(exc)
+        persist_assistant(f"Error: {error_text}", {"error": error_text})
+        _set_chat_run_finished(run_id, status="failed", error=error_text)
 
 
 @app.get("/api/config/llm")
@@ -447,6 +630,46 @@ async def test_db_config(request: Request) -> JSONResponse:
 async def get_agents() -> JSONResponse:
     state = store.read()
     return JSONResponse(content=state["agents"])
+
+
+@app.post("/api/agents/reorder")
+async def reorder_agents(request: Request) -> JSONResponse:
+    payload = await request.json()
+    ordered_ids = payload.get("ordered_ids")
+
+    if not isinstance(ordered_ids, list):
+        return JSONResponse(status_code=400, content={"error": "ordered_ids must be an array"})
+
+    def mutate(state: Dict[str, Any]) -> None:
+        id_to_agent: Dict[int, Dict[str, Any]] = {}
+        for agent in state.get("agents", []):
+            agent_id = _safe_int(agent.get("id"))
+            if agent_id is None:
+                continue
+            id_to_agent[agent_id] = agent
+
+        ordered_agents: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for raw_id in ordered_ids:
+            agent_id = _safe_int(raw_id)
+            if agent_id is None or agent_id in seen:
+                continue
+            agent = id_to_agent.get(agent_id)
+            if not agent:
+                continue
+            seen.add(agent_id)
+            ordered_agents.append(agent)
+
+        for agent in state.get("agents", []):
+            agent_id = _safe_int(agent.get("id"))
+            if agent_id is None or agent_id in seen:
+                continue
+            ordered_agents.append(agent)
+
+        state["agents"] = ordered_agents
+
+    store.mutate(mutate)
+    return JSONResponse(content={"success": True})
 
 
 @app.get("/api/agents/export")
@@ -627,6 +850,7 @@ async def clear_chat_thread(thread_id: int) -> JSONResponse:
             return False
         thread["messages"] = []
         thread["updated_at"] = _now_iso()
+        _set_thread_processing_state(thread, is_processing=False)
         return True
 
     cleared = store.mutate(mutate)
@@ -642,6 +866,112 @@ async def delete_chat_thread(thread_id: int) -> JSONResponse:
 
     store.mutate(mutate)
     return JSONResponse(content={"success": True})
+
+
+@app.get("/api/chat/runs/{run_id}")
+async def get_chat_run(run_id: str) -> JSONResponse:
+    run = _get_chat_run(run_id)
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "Run not found"})
+    run.pop("started_ts", None)
+    run.pop("finished_ts", None)
+    return JSONResponse(content=run)
+
+
+@app.post("/api/chat/{agent_id}/start")
+async def start_chat_agent(agent_id: int, request: Request) -> JSONResponse:
+    payload = await request.json()
+    message = str(payload.get("message") or "").strip()
+    requested_thread_id = _safe_int(payload.get("threadId"))
+    requested_thread_title = str(payload.get("threadTitle") or "").strip()
+
+    if not message:
+        return JSONResponse(status_code=400, content={"error": "Message is required"})
+
+    try:
+        state = store.read()
+        agent = next((a for a in state["agents"] if int(a.get("id", 0)) == agent_id), None)
+        if not agent:
+            return JSONResponse(status_code=404, content={"error": "Agent not found"})
+
+        llm_config = state["llm_config"][-1] if state["llm_config"] else None
+        if not llm_config:
+            return JSONResponse(status_code=400, content={"error": "LLM configuration not found"})
+
+        llm = build_llm(llm_config)
+        full_config = parse_agent_config(agent)
+        agent_name = str(agent.get("name") or agent.get("agent_type") or "agent")
+        run_id = uuid.uuid4().hex
+
+        try:
+            def mutate_user_message(state_mut: Dict[str, Any]) -> Dict[str, Any]:
+                thread = _find_thread(state_mut, requested_thread_id) if requested_thread_id is not None else None
+
+                if thread is None:
+                    new_thread_id = _next_id(state_mut, "next_thread_id")
+                    thread = build_thread_record(
+                        {
+                            "agent_id": agent_id,
+                            "title": requested_thread_title or f"Discussion {new_thread_id}",
+                        },
+                        new_thread_id,
+                    )
+                    state_mut["chat_threads"].append(thread)
+
+                thread_agent_id = _safe_int(thread.get("agent_id"))
+                if thread_agent_id is None:
+                    thread["agent_id"] = agent_id
+                elif thread_agent_id != agent_id:
+                    raise ValueError("Thread belongs to another agent")
+
+                if bool(thread.get("is_processing")):
+                    raise ValueError("This discussion is already running. Wait for completion before sending a new message.")
+
+                _auto_title_thread_if_needed(thread, message)
+                _append_message(thread, "user", message)
+                _set_thread_processing_state(thread, is_processing=True, run_id=run_id)
+
+                messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+                return {"thread_id": int(thread.get("id")), "messages": messages}
+
+            thread_write_result = store.mutate(mutate_user_message)
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+
+        resolved_thread_id = int(thread_write_result["thread_id"])
+        all_messages = (
+            thread_write_result.get("messages")
+            if isinstance(thread_write_result.get("messages"), list)
+            else []
+        )
+        previous_messages = all_messages[:-1] if len(all_messages) > 0 else []
+        memory_context = _format_memory_context(previous_messages)
+        execution_input = f"{memory_context}\n\nCurrent user message:\n{message}" if memory_context else message
+
+        _create_chat_run(run_id, resolved_thread_id, agent_id, agent_name)
+        asyncio.create_task(
+            _execute_chat_run_background(
+                run_id=run_id,
+                thread_id=resolved_thread_id,
+                agent=agent,
+                llm=llm,
+                full_config=full_config,
+                execution_input=execution_input,
+                agent_name=agent_name,
+            )
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "runId": run_id,
+                "threadId": resolved_thread_id,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc) or "Internal server error"})
 
 
 @app.post("/api/chat/{agent_id}")
