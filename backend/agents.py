@@ -4754,6 +4754,7 @@ def _should_mark_agent_unavailable(error_text: str) -> bool:
 
 def _extract_terminal_failure_reason(text: str) -> str | None:
     normalized = str(text or "").strip().lower()
+    normalized = normalized.replace("’", "'").replace("`", "'")
     if not normalized:
         return None
 
@@ -4767,14 +4768,24 @@ def _extract_terminal_failure_reason(text: str) -> str | None:
         return "external_access_blocked"
     if "cannot access external urls" in normalized or "cannot access external url" in normalized:
         return "external_access_blocked"
+    if "unable to fetch live rss feeds" in normalized:
+        return "external_access_blocked"
     if "http 403" in normalized or "403 forbidden" in normalized:
         return "http_forbidden"
     if "http 404" in normalized:
         return "http_not_found"
     if "invalid_url" in normalized:
         return "invalid_input_url"
+    if "no host supplied" in normalized:
+        return "invalid_input_url"
     if "no valid url provided" in normalized:
         return "invalid_input_url"
+    if "don't have the html" in normalized or "do not have the html" in normalized:
+        return "missing_source_data"
+    if "cannot retrieve that information" in normalized:
+        return "missing_source_data"
+    if "need the html" in normalized or "provide the page source" in normalized:
+        return "missing_source_data"
     if "web navigation failed" in normalized and ("block" in normalized or "javascript rendering" in normalized):
         return "external_access_blocked"
     return None
@@ -4784,13 +4795,159 @@ def _terminal_failure_threshold(reason: str) -> int:
     thresholds = {
         "dependency_missing": 1,
         "capability_refusal": 1,
-        "external_access_blocked": 2,
-        "http_forbidden": 2,
-        "http_not_found": 2,
+        "external_access_blocked": 1,
+        "http_forbidden": 1,
+        "http_not_found": 1,
         "invalid_input_url": 2,
+        "missing_source_data": 1,
         "excel_workbook_missing": 2,
     }
     return thresholds.get(reason, 2)
+
+
+def _extract_links_from_agent_answer(answer_text: str, max_items: int = 50) -> List[Dict[str, str]]:
+    parsed = _extract_possible_json(answer_text)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("links")
+    if not isinstance(parsed, list):
+        return []
+
+    links: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or item.get("site_name") or "").split()).strip()
+        url = str(item.get("url") or item.get("link") or "").strip()
+        parsed_url = urlparse(url)
+        if not title or parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            continue
+        normalized = url.rstrip("/").lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append({"title": title, "url": url})
+        if len(links) >= max_items:
+            break
+    return links
+
+
+def _looks_like_raw_html_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    markers = (
+        "full html",
+        "raw html",
+        "page source",
+        "html source",
+        "source html",
+        "return the html",
+        "return full page source",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _adapt_manager_call_input(
+    selected_agent: Dict[str, Any],
+    call_input: str,
+    user_input: str,
+    scratchpad: Dict[str, Any],
+) -> tuple[str, str | None]:
+    agent_type = str(selected_agent.get("agent_type") or "").strip().lower()
+    normalized_input = str(call_input or "").strip()
+    if not normalized_input:
+        normalized_input = str(user_input or "").strip()
+
+    if agent_type == "web_navigator" and _looks_like_raw_html_request(normalized_input):
+        urls = _extract_urls_from_text(normalized_input) or _extract_urls_from_text(str(user_input or ""))
+        if not urls:
+            remembered = str(scratchpad.get("last_target_url") or "").strip()
+            if remembered:
+                urls = [remembered]
+        target_url = urls[0] if urls else ""
+        limit = _extract_requested_item_limit(normalized_input or user_input, default_limit=10, hard_max=50)
+        if target_url:
+            rewritten = (
+                f"Open {target_url}. Extract the latest {limit} visible news/article items from the page. "
+                "Return ONLY a JSON array with fields `title` and `url`. "
+                "If timestamp is clearly visible, include optional field `timestamp`."
+            )
+            return rewritten, (
+                "Rewrote call: Web Navigator is optimized for extraction results, not raw HTML dump."
+            )
+
+    if agent_type == "web_scraper":
+        has_urls = len(_extract_urls_from_text(normalized_input)) > 0
+        remembered_links = scratchpad.get("last_web_links")
+        if (not has_urls) and isinstance(remembered_links, list) and len(remembered_links) > 0:
+            sample_urls: List[str] = []
+            for link in remembered_links[:8]:
+                if isinstance(link, dict):
+                    url = str(link.get("url") or "").strip()
+                    if url:
+                        sample_urls.append(url)
+            if len(sample_urls) > 0:
+                appendix = "\nUse these discovered URLs as direct sources:\n" + "\n".join(
+                    f"- {url}" for url in sample_urls
+                )
+                rewritten = f"{normalized_input}\n{appendix}".strip()
+                return rewritten, "Rewrote call: injected concrete source URLs discovered by Web Navigator."
+
+    return normalized_input, None
+
+
+def _is_low_value_manager_answer(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    generic_markers = (
+        "reached maximum steps without a final answer",
+        "reached max agent-call budget",
+        "manager completed orchestration but did not produce a final answer",
+        "orchestration error:",
+    )
+    return any(marker in lowered for marker in generic_markers)
+
+
+def _is_near_duplicate_call(
+    *,
+    agent_id: int | None,
+    call_input: str,
+    call_context: Dict[str, Any],
+    attempted_records: List[Dict[str, Any]],
+) -> bool:
+    if agent_id is None:
+        return False
+
+    normalized_input = _normalize_manager_call_input(call_input)
+    if not normalized_input:
+        return False
+
+    normalized_context = ""
+    if isinstance(call_context, dict) and len(call_context) > 0:
+        try:
+            normalized_context = json.dumps(call_context, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            normalized_context = str(call_context)
+
+    for record in attempted_records:
+        rec_agent_id = _safe_int(record.get("agent_id"))
+        if rec_agent_id != agent_id:
+            continue
+
+        rec_context = str(record.get("context") or "")
+        if rec_context != normalized_context:
+            continue
+
+        rec_input = str(record.get("input") or "")
+        if rec_input == normalized_input:
+            return True
+
+        similarity = SequenceMatcher(None, rec_input, normalized_input).ratio()
+        if similarity >= 0.93:
+            return True
+
+    return False
 
 
 def _summarize_terminal_failures_for_user(failures: List[Dict[str, Any]]) -> str:
@@ -4935,6 +5092,9 @@ class ManagerState(TypedDict):
     unavailable_agents: Dict[int, str]
     successful_call_signatures: set[str]
     attempted_call_signatures: set[str]
+    attempted_call_records: List[Dict[str, Any]]
+    informative_results: List[Dict[str, Any]]
+    stagnant_iterations: int
     current_plan: str
     plan_history: List[str]
     terminal_failure_counts: Dict[int, Dict[str, int]]
@@ -4977,6 +5137,9 @@ class MultiAgentManager:
             "unavailable_agents": unavailable_agents,
             "successful_call_signatures": set(),
             "attempted_call_signatures": set(),
+            "attempted_call_records": [],
+            "informative_results": [],
+            "stagnant_iterations": 0,
             "current_plan": "",
             "plan_history": [],
             "terminal_failure_counts": {},
@@ -4990,6 +5153,69 @@ class MultiAgentManager:
             state["steps"].append(step)
             if on_step:
                 on_step(step)
+
+        async def finalize_best_effort(
+            current_state: ManagerState,
+            *,
+            summary: str,
+            fallback_answer: str,
+            missing_information: str | None = None,
+        ) -> str:
+            synthesized = ""
+            try:
+                synthesized = await _synthesize_manager_fallback_answer(
+                    llm=current_state.get("llm"),
+                    user_input=str(current_state.get("input") or ""),
+                    conversation_history=str(current_state.get("conversation_history") or ""),
+                    scratchpad=(
+                        current_state.get("scratchpad")
+                        if isinstance(current_state.get("scratchpad"), dict)
+                        else {}
+                    ),
+                    steps=current_state.get("steps") if isinstance(current_state.get("steps"), list) else [],
+                )
+            except Exception as synth_exc:
+                add_step(
+                    {
+                        "status": "manager_finalize_failed",
+                        "error": str(synth_exc),
+                        "message": "Failed to synthesize best-effort final answer.",
+                    }
+                )
+
+            final_text = str(synthesized or "").strip()
+            if _is_low_value_manager_answer(final_text):
+                final_text = ""
+
+            if not final_text:
+                informative_results = current_state.get("informative_results") or []
+                if isinstance(informative_results, list) and len(informative_results) > 0:
+                    lines = [
+                        "Here is the best result I could produce with the available evidence:",
+                    ]
+                    for item in informative_results[-5:]:
+                        agent_name = str(item.get("agent") or "agent")
+                        answer_excerpt = _clip_text(str(item.get("answer") or ""), 260)
+                        if answer_excerpt:
+                            lines.append(f"- {agent_name}: {answer_excerpt}")
+                    if missing_information:
+                        lines.append(f"Missing information: {missing_information}")
+                    final_text = "\n".join(lines)
+
+            if not final_text:
+                final_text = fallback_answer
+
+            current_state["final_answer"] = final_text
+            add_step(
+                {
+                    "status": "manager_final",
+                    "answer": final_text,
+                    "manager_summary": summary,
+                    "missing_information": missing_information,
+                }
+            )
+            current_state["done"] = True
+            return final_text
 
         add_step(
             {
@@ -5060,15 +5286,12 @@ class MultiAgentManager:
                 return current_state
 
             if current_state["current_step"] >= current_state["max_steps"]:
-                current_state["final_answer"] = "Reached maximum steps without a final answer."
-                add_step(
-                    {
-                        "status": "manager_final",
-                        "answer": current_state["final_answer"],
-                        "manager_summary": "Max steps reached.",
-                    }
+                await finalize_best_effort(
+                    current_state,
+                    summary="Max steps reached; returning best effort from collected evidence.",
+                    fallback_answer="Reached maximum steps without a final answer.",
+                    missing_information="Execution budget exhausted before full completion.",
                 )
-                current_state["done"] = True
                 return current_state
 
             agent_catalog = [_agent_catalog_entry(agent) for agent in current_plannable_agents]
@@ -5135,6 +5358,7 @@ RULES:
 - If a tool fails, analyze cause and pick an alternative approach (no blind retry loops).
 - finish_task is the only valid way to stop.
 - Respect hard limits. If budget is low, prioritize closure.
+- Capability guardrail: Web Navigator should extract links/content summaries, not dump full raw HTML source.
 
 Definition of Done (all criteria should be checked before finish_task):
 {dod_text}
@@ -5390,17 +5614,31 @@ Return ONLY JSON:
                 )
 
                 if decision.get("status") == "final_answer":
-                    current_state["final_answer"] = decision.get("final_answer") or ""
-                    add_step(
-                        {
-                            "status": "manager_final",
-                            "answer": current_state["final_answer"],
-                            "manager_summary": rationale,
-                            "judge_verdict": "Pass",
-                            "missing_information": decision.get("missing_information"),
-                        }
-                    )
-                    current_state["done"] = True
+                    proposed_final = str(decision.get("final_answer") or "").strip()
+                    if _is_low_value_manager_answer(proposed_final):
+                        await finalize_best_effort(
+                            current_state,
+                            summary=(
+                                "Planner requested finish without a concrete answer; "
+                                "returning synthesized best effort."
+                            ),
+                            fallback_answer=(
+                                proposed_final or "Planner attempted to finish without a concrete final answer."
+                            ),
+                            missing_information=str(decision.get("missing_information") or "").strip() or None,
+                        )
+                    else:
+                        current_state["final_answer"] = proposed_final
+                        add_step(
+                            {
+                                "status": "manager_final",
+                                "answer": current_state["final_answer"],
+                                "manager_summary": rationale,
+                                "judge_verdict": "Pass",
+                                "missing_information": decision.get("missing_information"),
+                            }
+                        )
+                        current_state["done"] = True
                 elif (
                     decision.get("status") == "calling_agent"
                     and isinstance(decision.get("calls"), list)
@@ -5408,15 +5646,15 @@ Return ONLY JSON:
                 ):
                     remaining_agent_calls = current_state["max_agent_calls"] - current_state["agent_calls_count"]
                     if remaining_agent_calls <= 0:
-                        current_state["final_answer"] = "Reached max agent-call budget. Provide a final answer from gathered evidence."
-                        add_step(
-                            {
-                                "status": "manager_final",
-                                "answer": current_state["final_answer"],
-                                "manager_summary": "Max agent-call budget reached.",
-                            }
+                        await finalize_best_effort(
+                            current_state,
+                            summary="Max agent-call budget reached; returning best effort.",
+                            fallback_answer=(
+                                "Reached max agent-call budget. "
+                                "Provide a final answer from gathered evidence."
+                            ),
+                            missing_information="Agent-call budget exhausted before full completion.",
                         )
-                        current_state["done"] = True
                     else:
                         raw_calls = [call for call in decision["calls"] if isinstance(call, dict)]
                         bounded_calls = raw_calls[:remaining_agent_calls]
@@ -5466,6 +5704,29 @@ Return ONLY JSON:
                             call_input = str(call.get("input") or "").strip() or str(current_state["input"])
                             call_context = _extract_manager_call_context(call)
                             selected_id = _safe_int(selected.get("id"))
+                            adapted_input, adaptation_note = _adapt_manager_call_input(
+                                selected_agent=selected,
+                                call_input=call_input,
+                                user_input=str(current_state.get("input") or ""),
+                                scratchpad=(
+                                    current_state.get("scratchpad")
+                                    if isinstance(current_state.get("scratchpad"), dict)
+                                    else {}
+                                ),
+                            )
+                            if adapted_input:
+                                call_input = adapted_input
+                            if adaptation_note:
+                                add_step(
+                                    {
+                                        "status": "manager_call_rewritten",
+                                        "agent": selected.get("name"),
+                                        "agent_id": selected_id,
+                                        "message": adaptation_note,
+                                        "input": call_input,
+                                    }
+                                )
+
                             signature = _manager_call_signature(selected_id, call_input, call_context)
                             if signature in current_state["attempted_call_signatures"]:
                                 add_step(
@@ -5483,7 +5744,38 @@ Return ONLY JSON:
                                     }
                                 )
                                 continue
+                            if _is_near_duplicate_call(
+                                agent_id=selected_id,
+                                call_input=call_input,
+                                call_context=call_context,
+                                attempted_records=current_state.get("attempted_call_records") or [],
+                            ):
+                                add_step(
+                                    {
+                                        "status": "manager_warning",
+                                        "message": (
+                                            "Skipping near-duplicate call (same agent + very similar context)."
+                                        ),
+                                        "agent": selected.get("name"),
+                                        "agent_id": selected_id,
+                                        "input": call_input,
+                                        "query_name": call_context.get("query_name"),
+                                        "params": call_context.get("params"),
+                                    }
+                                )
+                                continue
                             current_state["attempted_call_signatures"].add(signature)
+                            current_state["attempted_call_records"].append(
+                                {
+                                    "agent_id": selected_id,
+                                    "input": _normalize_manager_call_input(call_input),
+                                    "context": (
+                                        json.dumps(call_context, sort_keys=True, ensure_ascii=False)
+                                        if len(call_context) > 0
+                                        else ""
+                                    ),
+                                }
+                            )
                             resolved_calls.append((call, selected, call_input, call_context, signature))
 
                         if len(resolved_calls) == 0:
@@ -5493,6 +5785,24 @@ Return ONLY JSON:
                                     "message": "Manager requested calls, but none matched existing agents.",
                                 }
                             )
+                            current_state["stagnant_iterations"] = int(
+                                current_state.get("stagnant_iterations") or 0
+                            ) + 1
+                            if (
+                                int(current_state.get("stagnant_iterations") or 0) >= 2
+                                and bool(current_state.get("informative_results"))
+                                and remaining_steps <= 2
+                            ):
+                                await finalize_best_effort(
+                                    current_state,
+                                    summary=(
+                                        "Stopping because only duplicate/invalid calls remained "
+                                        "and useful evidence was already collected."
+                                    ),
+                                    fallback_answer=(
+                                        "The manager stopped repeated invalid calls and returned the best available answer."
+                                    ),
+                                )
                         else:
                             current_state["agent_calls_count"] += len(resolved_calls)
                             add_step(
@@ -5593,11 +5903,33 @@ Return ONLY JSON:
                                                 "reason": answer_text,
                                             }
                                         )
+
+                                    input_urls = _extract_urls_from_text(call_input)
+                                    if len(input_urls) > 0:
+                                        current_state["scratchpad"]["last_target_url"] = input_urls[0]
+
+                                    links_from_answer = _extract_links_from_agent_answer(answer_text, max_items=50)
+                                    selected_type = str(selected.get("agent_type") or "").strip().lower()
+                                    if selected_type == "web_navigator" and len(links_from_answer) > 0:
+                                        current_state["scratchpad"]["last_web_links"] = links_from_answer
+                                        current_state["scratchpad"]["last_target_url"] = str(
+                                            links_from_answer[0].get("url") or current_state["scratchpad"].get("last_target_url") or ""
+                                        )
                                     informative = bool(
                                         answer_text
                                         and not terminal_reason
                                         and not _is_generic_orchestration_text(answer_text)
                                     )
+                                    if informative:
+                                        current_state["informative_results"].append(
+                                            {
+                                                "agent": selected.get("name"),
+                                                "agent_type": selected.get("agent_type"),
+                                                "input": _clip_text(call_input, 260),
+                                                "answer": _clip_text(answer_text, 700),
+                                                "links_count": len(links_from_answer),
+                                            }
+                                        )
                                     return {
                                         "trace": f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n",
                                         "informative": informative,
@@ -5756,29 +6088,93 @@ Return ONLY JSON:
                                 )
 
                             informative_outcomes = [item for item in outcomes if bool(item.get("informative"))]
-                            if len(informative_outcomes) == 0:
+                            if len(informative_outcomes) > 0:
+                                current_state["stagnant_iterations"] = 0
+                            else:
+                                current_state["stagnant_iterations"] = int(
+                                    current_state.get("stagnant_iterations") or 0
+                                ) + 1
+
                                 terminal_outcomes = [
                                     item for item in outcomes if item.get("terminal_reason")
                                 ]
-                                if len(terminal_outcomes) > 0 and all(bool(item.get("marked_unavailable")) for item in terminal_outcomes):
-                                    current_state["final_answer"] = _summarize_terminal_failures_for_user(
-                                        [
-                                            {
-                                                "agent": item.get("agent"),
-                                                "reason": item.get("terminal_reason"),
-                                                "detail": item.get("detail"),
-                                            }
-                                            for item in terminal_outcomes
-                                        ]
+                                if len(terminal_outcomes) > 0:
+                                    terminal_reasons = {
+                                        str(item.get("terminal_reason") or "")
+                                        for item in terminal_outcomes
+                                        if item.get("terminal_reason")
+                                    }
+                                    all_terminal_marked = all(
+                                        bool(item.get("marked_unavailable")) for item in terminal_outcomes
                                     )
-                                    add_step(
-                                        {
-                                            "status": "manager_final",
-                                            "answer": current_state["final_answer"],
-                                            "manager_summary": "Stopped after repeated terminal agent failures.",
-                                        }
+                                    has_prior_evidence = bool(current_state.get("informative_results"))
+                                    hard_terminal_reasons = {
+                                        "external_access_blocked",
+                                        "http_forbidden",
+                                        "http_not_found",
+                                        "invalid_input_url",
+                                        "missing_source_data",
+                                        "capability_refusal",
+                                    }
+
+                                    if all_terminal_marked:
+                                        await finalize_best_effort(
+                                            current_state,
+                                            summary="Stopped after repeated terminal agent failures.",
+                                            fallback_answer=_summarize_terminal_failures_for_user(
+                                                [
+                                                    {
+                                                        "agent": item.get("agent"),
+                                                        "reason": item.get("terminal_reason"),
+                                                        "detail": item.get("detail"),
+                                                    }
+                                                    for item in terminal_outcomes
+                                                ]
+                                            ),
+                                            missing_information=(
+                                                "Some required data could not be retrieved because external "
+                                                "sources were blocked/unavailable."
+                                            ),
+                                        )
+                                    elif has_prior_evidence and (
+                                        len(terminal_reasons.intersection(hard_terminal_reasons)) > 0
+                                    ):
+                                        await finalize_best_effort(
+                                            current_state,
+                                            summary=(
+                                                "Returning best effort after a terminal external-data failure "
+                                                "while prior evidence was already available."
+                                            ),
+                                            fallback_answer=_summarize_terminal_failures_for_user(
+                                                [
+                                                    {
+                                                        "agent": item.get("agent"),
+                                                        "reason": item.get("terminal_reason"),
+                                                        "detail": item.get("detail"),
+                                                    }
+                                                    for item in terminal_outcomes
+                                                ]
+                                            ),
+                                            missing_information=(
+                                                "Live extraction did not fully succeed for all requested fields."
+                                            ),
+                                        )
+                                elif (
+                                    int(current_state.get("stagnant_iterations") or 0) >= 2
+                                    and bool(current_state.get("informative_results"))
+                                    and remaining_steps <= 2
+                                ):
+                                    await finalize_best_effort(
+                                        current_state,
+                                        summary=(
+                                            "Stopping iterative loop and returning best available answer "
+                                            "from existing evidence."
+                                        ),
+                                        fallback_answer=(
+                                            "I stopped additional retries to avoid redundant loops and returned "
+                                            "the best available result."
+                                        ),
                                     )
-                                    current_state["done"] = True
                 else:
                     current_state["conversation_history"] += f"\nManager thought: {rationale}\n"
                     current_state["history_summary"] = _update_history_summary(
@@ -5793,15 +6189,12 @@ Return ONLY JSON:
 
             current_state["current_step"] += 1
             if current_state["current_step"] >= current_state["max_steps"] and not current_state["done"]:
-                current_state["final_answer"] = "Reached maximum steps without a final answer."
-                add_step(
-                    {
-                        "status": "manager_final",
-                        "answer": current_state["final_answer"],
-                        "manager_summary": "Max steps reached.",
-                    }
+                await finalize_best_effort(
+                    current_state,
+                    summary="Max steps reached; returning best effort from collected evidence.",
+                    fallback_answer="Reached maximum steps without a final answer.",
+                    missing_information="Execution budget exhausted before full completion.",
                 )
-                current_state["done"] = True
 
             return current_state
 
@@ -5820,7 +6213,7 @@ Return ONLY JSON:
         if not final_answer:
             final_answer = _extract_manager_answer_from_steps(steps)
 
-        if not final_answer:
+        if not final_answer or _is_low_value_manager_answer(final_answer):
             try:
                 synthesized = await _synthesize_manager_fallback_answer(
                     llm=final_state.get("llm"),
@@ -5846,6 +6239,9 @@ Return ONLY JSON:
                         "message": "Failed to synthesize fallback final answer.",
                     }
                 )
+
+        if _is_low_value_manager_answer(final_answer):
+            final_answer = ""
 
         if not final_answer:
             final_answer = "Manager completed orchestration but did not produce a final answer."
