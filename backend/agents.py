@@ -73,14 +73,157 @@ def _normalize_identifier(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def _normalize_clickhouse_specific_param_name(value: Any) -> str:
+    token = str(value or "").strip().strip("{}")
+    if not token:
+        return ""
+    return re.sub(r"[^A-Za-z0-9_]+", "", token)
+
+
+def _extract_clickhouse_specific_tokens_from_sql(sql: str) -> List[str]:
+    tokens: List[str] = []
+    if not sql:
+        return tokens
+
+    for match in re.finditer(r"\{([A-Za-z][A-Za-z0-9_]*)\}", sql):
+        token = _normalize_clickhouse_specific_param_name(match.group(1))
+        if token and token not in tokens:
+            tokens.append(token)
+
+    for match in re.finditer(r"(?<![A-Za-z0-9_])(P\d{1,3})(?![A-Za-z0-9_])", sql):
+        token = _normalize_clickhouse_specific_param_name(match.group(1))
+        if token and token not in tokens:
+            tokens.append(token)
+
+    return tokens
+
+
+def _normalize_clickhouse_specific_templates(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_templates = config.get("query_templates")
+    if raw_templates is None:
+        raw_templates = config.get("queries")
+    if raw_templates is None:
+        raw_templates = config.get("templates")
+    if raw_templates is None and isinstance(config.get("sql_query_template"), str):
+        raw_templates = [
+            {
+                "name": "default",
+                "sql": config.get("sql_query_template"),
+                "parameters": config.get("sql_parameters") or [],
+            }
+        ]
+
+    entries: List[Dict[str, Any]] = []
+    if isinstance(raw_templates, dict):
+        for name, value in raw_templates.items():
+            if isinstance(value, str):
+                entries.append({"name": str(name), "sql": value})
+            elif isinstance(value, dict):
+                entries.append({"name": str(value.get("name") or name), **value})
+    elif isinstance(raw_templates, list):
+        for idx, item in enumerate(raw_templates):
+            if isinstance(item, str):
+                entries.append({"name": f"query_{idx + 1}", "sql": item})
+            elif isinstance(item, dict):
+                entries.append(item)
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, item in enumerate(entries):
+        sql = str(item.get("sql") or item.get("query") or item.get("template") or "").strip()
+        if not sql:
+            continue
+
+        name = str(item.get("name") or f"query_{idx + 1}").strip()
+        if not name:
+            name = f"query_{idx + 1}"
+        description = str(item.get("description") or item.get("objective") or "").strip()
+
+        raw_params = item.get("parameters")
+        if raw_params is None:
+            raw_params = item.get("params")
+
+        parameters: List[Dict[str, Any]] = []
+        if isinstance(raw_params, list):
+            for raw_param in raw_params:
+                if isinstance(raw_param, str):
+                    param_name = _normalize_clickhouse_specific_param_name(raw_param)
+                    if not param_name:
+                        continue
+                    parameters.append(
+                        {
+                            "name": param_name,
+                            "required": True,
+                            "quote": "auto",
+                            "default": None,
+                            "description": "",
+                        }
+                    )
+                elif isinstance(raw_param, dict):
+                    param_name = _normalize_clickhouse_specific_param_name(raw_param.get("name"))
+                    if not param_name:
+                        continue
+                    quote_mode = str(raw_param.get("quote") or "auto").strip().lower()
+                    if quote_mode not in {"auto", "none", "string"}:
+                        quote_mode = "auto"
+                    parameters.append(
+                        {
+                            "name": param_name,
+                            "required": bool(raw_param.get("required", True)),
+                            "quote": quote_mode,
+                            "default": raw_param.get("default"),
+                            "description": str(raw_param.get("description") or "").strip(),
+                        }
+                    )
+
+        if len(parameters) == 0:
+            derived_tokens = _extract_clickhouse_specific_tokens_from_sql(sql)
+            parameters = [
+                {
+                    "name": token,
+                    "required": True,
+                    "quote": "auto",
+                    "default": None,
+                    "description": "",
+                }
+                for token in derived_tokens
+            ]
+
+        normalized.append(
+            {
+                "name": name,
+                "description": description,
+                "sql": sql,
+                "parameters": parameters,
+            }
+        )
+
+    return normalized
+
+
 def _agent_catalog_entry(agent: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    entry = {
         "id": agent.get("id"),
         "name": agent.get("name"),
         "agent_type": agent.get("agent_type"),
         "role": agent.get("role"),
         "objectives": agent.get("objectives"),
     }
+
+    if str(agent.get("agent_type") or "").strip().lower() == "clickhouse_specific":
+        config = build_agent_execution_config(agent)
+        templates = _normalize_clickhouse_specific_templates(config)
+        entry["query_templates"] = [
+            {
+                "name": template.get("name"),
+                "description": template.get("description"),
+                "parameters": [param.get("name") for param in template.get("parameters", []) if param.get("name")],
+            }
+            for template in templates
+        ]
+        entry["default_query"] = config.get("default_query")
+        entry["supports_params"] = True
+
+    return entry
 
 
 def _agent_aliases(agent: Dict[str, Any]) -> List[str]:
@@ -205,12 +348,107 @@ def _extract_urls_from_text(text: str) -> List[str]:
     urls: List[str] = []
     seen: set[str] = set()
     for raw in matches:
-        cleaned = raw.rstrip(").,;!?]")
-        if cleaned in seen:
+        cleaned = str(raw).strip().strip("<>[](){}\"'")
+        cleaned = cleaned.rstrip(").,;!?]")
+        parsed = urlparse(cleaned)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
-        seen.add(cleaned)
+        normalized = cleaned.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
         urls.append(cleaned)
     return urls
+
+
+def _normalize_navigation_url_candidates(urls: List[str]) -> tuple[List[str], List[str]]:
+    valid: List[str] = []
+    invalid: List[str] = []
+    seen_valid: set[str] = set()
+    seen_invalid: set[str] = set()
+
+    for raw in urls:
+        candidate = str(raw or "").strip().strip("<>[](){}\"'")
+        candidate = candidate.rstrip(").,;!?]")
+        if not candidate:
+            continue
+
+        parsed = urlparse(candidate)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            normalized = candidate.rstrip("/")
+            if normalized in seen_valid:
+                continue
+            seen_valid.add(normalized)
+            valid.append(candidate)
+            continue
+
+        normalized_invalid = candidate.lower()
+        if normalized_invalid in seen_invalid:
+            continue
+        seen_invalid.add(normalized_invalid)
+        invalid.append(candidate)
+
+    return valid, invalid
+
+
+def _extract_raw_navigation_tokens(text: str) -> List[str]:
+    matches = re.findall(r"https?://[^\s<>\"]*", text or "")
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        token = str(match or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(token)
+    return tokens
+
+
+def _build_recent_manager_trace(steps: List[Dict[str, Any]], limit: int = 8) -> str:
+    recent = steps[-limit:] if len(steps) > limit else steps
+    lines: List[str] = []
+    for step in recent:
+        status = str(step.get("status") or "unknown")
+        agent = str(step.get("agent") or "")
+        message = str(step.get("message") or "")
+        rationale = str(step.get("rationale") or "")
+        result = step.get("result")
+        result_answer = ""
+        if isinstance(result, dict):
+            result_answer = str(result.get("answer") or "")
+        parts = [f"status={status}"]
+        if agent:
+            parts.append(f"agent={agent}")
+        if message:
+            parts.append(f"message={message[:240]}")
+        if rationale:
+            parts.append(f"rationale={rationale[:240]}")
+        if result_answer:
+            parts.append(f"result={result_answer[:280]}")
+        lines.append("- " + " | ".join(parts))
+    return "\n".join(lines) if lines else "- (no prior steps)"
+
+
+def _plan_revision_summary(previous_plan: str, current_plan: str) -> str:
+    previous = str(previous_plan or "").strip()
+    current = str(current_plan or "").strip()
+    if not previous and not current:
+        return "No explicit plan was produced."
+    if not previous and current:
+        return "Initial plan established."
+    if previous == current:
+        return "Plan unchanged from previous iteration."
+    return "Plan updated based on new evidence."
+
+
+def _clip_text(value: str, max_chars: int = 1200) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
 
 
 def _extract_requested_item_limit(text: str, default_limit: int = 10, hard_max: int = 50) -> int:
@@ -1935,6 +2173,104 @@ Execution steps:
     return content
 
 
+def _collect_param_assignments_from_text(text: str) -> Dict[str, Any]:
+    assignments: Dict[str, Any] = {}
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*)\s*(?:=|:)\s*(\"[^\"]*\"|'[^']*'|[^,\n;]+)"
+    )
+    for match in pattern.finditer(text or ""):
+        key = _normalize_clickhouse_specific_param_name(match.group(1))
+        if not key:
+            continue
+        raw_value = str(match.group(2)).strip().rstrip(".")
+        if (raw_value.startswith('"') and raw_value.endswith('"')) or (
+            raw_value.startswith("'") and raw_value.endswith("'")
+        ):
+            raw_value = raw_value[1:-1]
+        assignments[key] = raw_value
+    return assignments
+
+
+def _normalize_clickhouse_specific_params(raw_params: Any) -> Dict[str, Any]:
+    if not isinstance(raw_params, dict):
+        return {}
+    normalized: Dict[str, Any] = {}
+    for key, value in raw_params.items():
+        param_name = _normalize_clickhouse_specific_param_name(key)
+        if not param_name:
+            continue
+        normalized[param_name] = value
+    return normalized
+
+
+def _resolve_clickhouse_specific_template(
+    templates: List[Dict[str, Any]],
+    query_name: str,
+    default_query: str,
+) -> Dict[str, Any] | None:
+    if len(templates) == 0:
+        return None
+
+    requested = _normalize_identifier(query_name)
+    if requested:
+        for template in templates:
+            if _normalize_identifier(template.get("name")) == requested:
+                return template
+
+    default_normalized = _normalize_identifier(default_query)
+    if default_normalized:
+        for template in templates:
+            if _normalize_identifier(template.get("name")) == default_normalized:
+                return template
+
+    return templates[0]
+
+
+def _looks_like_number(value: str) -> bool:
+    return bool(re.fullmatch(r"-?\d+(\.\d+)?", value.strip()))
+
+
+def _format_clickhouse_specific_value(value: Any, quote_mode: str) -> str:
+    if value is None:
+        return "NULL"
+
+    if isinstance(value, list):
+        return ", ".join(_format_clickhouse_specific_value(item, quote_mode) for item in value)
+
+    if isinstance(value, bool):
+        return "1" if value else "0"
+
+    if isinstance(value, (int, float)):
+        return str(value)
+
+    text = str(value)
+    normalized_quote_mode = (quote_mode or "auto").strip().lower()
+    if normalized_quote_mode == "none":
+        return text
+    if normalized_quote_mode == "auto" and _looks_like_number(text):
+        return text
+
+    escaped = text.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _replace_clickhouse_specific_placeholder(sql: str, token: str, replacement: str) -> tuple[str, int]:
+    replaced = 0
+    output = sql
+
+    output, count_braced = re.subn(r"\{" + re.escape(token) + r"\}", replacement, output)
+    replaced += count_braced
+
+    output, count_plain = re.subn(
+        r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])",
+        replacement,
+        output,
+    )
+    replaced += count_plain
+
+    return output, replaced
+
+
 class AgentExecutor:
     @staticmethod
     async def execute(
@@ -1944,6 +2280,7 @@ class AgentExecutor:
         llm: Any,
         on_step: StepCallback | None = None,
         agent_name: str | None = None,
+        invocation: Dict[str, Any] | None = None,
     ) -> AgentResult:
         system_prompt = "You are a helpful AI assistant."
         extra_context = ""
@@ -2003,6 +2340,176 @@ CRITICAL SECURITY RULE:
 - Ensure all inserted data is properly escaped and formatted.
 
 Return your response in JSON format: {{ "sql": "INSERT INTO agent_... ", "answer": "Data inserted." }}"""
+        elif agent_type == "clickhouse_specific":
+            templates = _normalize_clickhouse_specific_templates(config)
+            default_query = str(config.get("default_query") or "").strip()
+
+            invocation_payload = invocation if isinstance(invocation, dict) else {}
+            query_name = str(
+                invocation_payload.get("query_name")
+                or invocation_payload.get("template_name")
+                or ""
+            ).strip()
+
+            provided_params: Dict[str, Any] = {}
+            provided_params.update(_normalize_clickhouse_specific_params(invocation_payload.get("params")))
+            provided_params.update(_normalize_clickhouse_specific_params(invocation_payload.get("parameters")))
+
+            parsed_input = _extract_possible_json(user_input)
+            effective_request = user_input
+            if isinstance(parsed_input, dict):
+                query_name = query_name or str(
+                    parsed_input.get("query_name")
+                    or parsed_input.get("template_name")
+                    or parsed_input.get("query")
+                    or ""
+                ).strip()
+                provided_params.update(_normalize_clickhouse_specific_params(parsed_input.get("params")))
+                provided_params.update(_normalize_clickhouse_specific_params(parsed_input.get("parameters")))
+                for key in ("input", "request", "message", "task"):
+                    value = parsed_input.get(key)
+                    if isinstance(value, str) and value.strip():
+                        effective_request = value.strip()
+                        break
+
+            text_assignments = _collect_param_assignments_from_text(effective_request)
+            for key, value in text_assignments.items():
+                provided_params.setdefault(key, value)
+
+            selected_template = _resolve_clickhouse_specific_template(templates, query_name, default_query)
+            if selected_template is None:
+                available = [template.get("name") for template in templates if template.get("name")]
+                message = (
+                    "No ClickHouse query template is configured for this agent. "
+                    "Add `query_templates` in agent config."
+                )
+                if available:
+                    message += f" Available templates: {', '.join(str(item) for item in available)}."
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": message,
+                    },
+                )
+                return {
+                    "answer": message,
+                    "details": {
+                        "available_templates": available,
+                    },
+                }
+
+            sql_template = str(selected_template.get("sql") or "").strip()
+            template_name = str(selected_template.get("name") or "default").strip() or "default"
+            param_specs = selected_template.get("parameters")
+            if not isinstance(param_specs, list):
+                param_specs = []
+
+            normalized_lookup = {
+                _normalize_identifier(key): value for key, value in provided_params.items()
+            }
+
+            rendered_sql = sql_template
+            applied_params: Dict[str, Any] = {}
+            missing_params: List[str] = []
+
+            for raw_spec in param_specs:
+                if not isinstance(raw_spec, dict):
+                    continue
+                param_name = _normalize_clickhouse_specific_param_name(raw_spec.get("name"))
+                if not param_name:
+                    continue
+
+                normalized_param_name = _normalize_identifier(param_name)
+                value = normalized_lookup.get(normalized_param_name)
+                if value in (None, ""):
+                    default_value = raw_spec.get("default")
+                    if default_value not in (None, ""):
+                        value = default_value
+
+                required = bool(raw_spec.get("required", True))
+                if value in (None, ""):
+                    if required:
+                        missing_params.append(param_name)
+                    continue
+
+                replacement = _format_clickhouse_specific_value(value, str(raw_spec.get("quote") or "auto"))
+                rendered_sql, _ = _replace_clickhouse_specific_placeholder(rendered_sql, param_name, replacement)
+                applied_params[param_name] = value
+
+            unresolved_tokens = [
+                token for token in _extract_clickhouse_specific_tokens_from_sql(rendered_sql)
+                if _normalize_identifier(token) in {
+                    _normalize_identifier(str(spec.get("name") or ""))
+                    for spec in param_specs
+                    if isinstance(spec, dict)
+                }
+            ]
+            for unresolved in unresolved_tokens:
+                if unresolved not in missing_params:
+                    missing_params.append(unresolved)
+
+            if len(missing_params) > 0:
+                missing_unique = list(dict.fromkeys(missing_params))
+                missing_label = ", ".join(missing_unique)
+                answer = (
+                    f"Template `{template_name}` selected but missing required parameters: {missing_label}. "
+                    "Provide them as `P1=value` in message or via manager call `params`."
+                )
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "Missing required parameters for ClickHouse template.",
+                        "template_name": template_name,
+                        "missing_params": missing_unique,
+                    },
+                )
+                return {
+                    "answer": answer,
+                    "sql": sql_template,
+                    "details": {
+                        "template_name": template_name,
+                        "missing_params": missing_unique,
+                        "provided_params": provided_params,
+                        "available_templates": [
+                            template.get("name") for template in templates if template.get("name")
+                        ],
+                    },
+                }
+
+            _emit_step(
+                on_step,
+                {
+                    "status": "sql_template_rendered",
+                    "agent": agent_label,
+                    "template_name": template_name,
+                    "params": applied_params,
+                    "sql": rendered_sql,
+                },
+            )
+            _emit_step(
+                on_step,
+                {
+                    "status": "agent_completed",
+                    "agent": agent_label,
+                    "message": "Parameterized SQL rendered successfully.",
+                },
+            )
+            return {
+                "answer": (
+                    f"Template `{template_name}` prepared successfully with "
+                    f"{len(applied_params)} parameter(s)."
+                ),
+                "sql": rendered_sql,
+                "details": {
+                    "template_name": template_name,
+                    "applied_params": applied_params,
+                    "sql_template": sql_template,
+                },
+            }
         elif agent_type == "knowledge_base_assistant":
             system_prompt = f"""You are an internal Knowledge Base Assistant (Concierge Interne).
 Vector DB: {config.get('vector_db') or 'qdrant'}
@@ -2241,11 +2748,14 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 except Exception:
                     pass
         elif agent_type == "web_navigator":
-            navigation_urls = _extract_urls_from_text(user_input)
+            raw_tokens = _extract_raw_navigation_tokens(user_input)
+            navigation_urls, invalid_navigation_urls = _normalize_navigation_url_candidates(raw_tokens)
             if not navigation_urls:
                 start_url = str(config.get("start_url") or "").strip()
                 if start_url:
-                    navigation_urls = [start_url]
+                    fallback_urls, invalid_fallback = _normalize_navigation_url_candidates([start_url])
+                    navigation_urls = fallback_urls
+                    invalid_navigation_urls.extend(invalid_fallback)
 
             max_nav_steps = max(1, min(int(config.get("max_steps") or 5), 10))
             default_item_limit = int(config.get("max_links") or config.get("max_items") or 10)
@@ -2256,7 +2766,23 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 same_domain_only = True
             same_domain_only = bool(same_domain_only)
 
+            if invalid_navigation_urls:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "navigator_url_skipped",
+                        "agent": agent_label,
+                        "invalid_urls": invalid_navigation_urls[:10],
+                        "message": "Ignored malformed URL candidates before navigation.",
+                    },
+                )
+
             if len(navigation_urls) == 0:
+                details = (
+                    f" Invalid URL(s): {', '.join(invalid_navigation_urls[:5])}."
+                    if invalid_navigation_urls
+                    else ""
+                )
                 _emit_step(
                     on_step,
                     {
@@ -2265,7 +2791,13 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                         "message": "No URL provided to web navigator.",
                     },
                 )
-                return {"answer": "No URL provided. Please include a target URL or configure `start_url`."}
+                return {
+                    "answer": (
+                        "No valid URL provided. Please include a full URL with host "
+                        "(e.g. https://example.com) or configure `start_url`."
+                        + details
+                    )
+                }
 
             headers = {
                 "User-Agent": (
@@ -2362,6 +2894,7 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     "details": {
                         "links": payload,
                         "requested_urls": requested_urls,
+                        "invalid_urls": invalid_navigation_urls,
                         "failures": failures,
                     },
                 }
@@ -2381,7 +2914,14 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     "message": "Navigation finished with no extractable links.",
                 },
             )
-            return {"answer": fallback_message, "details": {"requested_urls": requested_urls, "failures": failures}}
+            return {
+                "answer": fallback_message,
+                "details": {
+                    "requested_urls": requested_urls,
+                    "invalid_urls": invalid_navigation_urls,
+                    "failures": failures,
+                },
+            }
         else:
             system_prompt = f"""Role: {config.get('role') or 'Assistant'}
 Persona: {config.get('persona') or 'Helpful'}
@@ -2538,6 +3078,11 @@ def _runtime_unavailable_reason_for_agent(agent: Dict[str, Any]) -> str | None:
     agent_type = str(agent.get("agent_type") or "").strip().lower()
     config = build_agent_execution_config(agent)
 
+    if agent_type == "clickhouse_specific":
+        templates = _normalize_clickhouse_specific_templates(config)
+        if len(templates) == 0:
+            return "Missing ClickHouse templates (`query_templates`) configuration."
+
     if agent_type == "excel_manager":
         try:
             import openpyxl  # type: ignore  # noqa: F401
@@ -2575,8 +3120,33 @@ def _normalize_manager_call_input(value: str) -> str:
     return normalized[:600]
 
 
-def _manager_call_signature(agent_id: int | None, call_input: str) -> str:
-    return f"{agent_id or 0}|{_normalize_manager_call_input(call_input)}"
+def _extract_manager_call_context(call: Dict[str, Any]) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    query_name = str(call.get("query_name") or call.get("template_name") or "").strip()
+    if query_name:
+        context["query_name"] = query_name
+
+    params: Dict[str, Any] = {}
+    params.update(_normalize_clickhouse_specific_params(call.get("params")))
+    params.update(_normalize_clickhouse_specific_params(call.get("parameters")))
+    if len(params) > 0:
+        context["params"] = params
+
+    return context
+
+
+def _manager_call_signature(
+    agent_id: int | None,
+    call_input: str,
+    call_context: Dict[str, Any] | None = None,
+) -> str:
+    normalized_context = ""
+    if isinstance(call_context, dict) and len(call_context) > 0:
+        try:
+            normalized_context = json.dumps(call_context, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            normalized_context = str(call_context)
+    return f"{agent_id or 0}|{_normalize_manager_call_input(call_input)}|{normalized_context}"
 
 
 def _should_mark_agent_unavailable(error_text: str) -> bool:
@@ -2607,6 +3177,9 @@ class ManagerState(TypedDict):
     final_answer: str
     unavailable_agents: Dict[int, str]
     successful_call_signatures: set[str]
+    attempted_call_signatures: set[str]
+    current_plan: str
+    plan_history: List[str]
 
 
 class MultiAgentManager:
@@ -2635,12 +3208,15 @@ class MultiAgentManager:
             "scratchpad": {},
             "current_step": 0,
             "agent_calls_count": 0,
-            "max_agent_calls": int(cfg.get("max_agent_calls") or 20),
-            "max_steps": int(cfg.get("max_steps") or 10),
+            "max_agent_calls": max(1, int(cfg.get("max_agent_calls") or 15)),
+            "max_steps": max(1, int(cfg.get("max_steps") or 8)),
             "done": False,
             "final_answer": "",
             "unavailable_agents": unavailable_agents,
             "successful_call_signatures": set(),
+            "attempted_call_signatures": set(),
+            "current_plan": "",
+            "plan_history": [],
         }
 
         def add_step(step: Dict[str, Any]) -> None:
@@ -2738,6 +3314,26 @@ class MultiAgentManager:
                 for agent in current_state["active_agents"]
                 if (_safe_int(agent.get("id")) or -1) in current_state["unavailable_agents"]
             ]
+            previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 1600) or "No prior plan yet."
+            recent_trace = _build_recent_manager_trace(current_state.get("steps") or [])
+            manager_policy_prompt = _clip_text(
+                str(current_state.get("manager_config", {}).get("system_prompt") or ""),
+                2400,
+            )
+
+            add_step(
+                {
+                    "status": "manager_iteration_start",
+                    "iteration": current_state["current_step"] + 1,
+                    "remaining_steps": max(current_state["max_steps"] - current_state["current_step"], 0),
+                    "remaining_agent_calls": max(
+                        current_state["max_agent_calls"] - current_state["agent_calls_count"],
+                        0,
+                    ),
+                    "current_plan": previous_plan,
+                }
+            )
+
             manager_prompt = f"""You are an advanced Multi-Agent Orchestrator.
 Available agents catalog (always use agent_id when possible and only choose from this list):
 {json.dumps(agent_catalog, ensure_ascii=False, indent=2)}
@@ -2745,12 +3341,21 @@ Available agents catalog (always use agent_id when possible and only choose from
 Unavailable agents (DO NOT CALL):
 {json.dumps(unavailable_summary, ensure_ascii=False, indent=2)}
 
+Manager operating prompt (must follow):
+{manager_policy_prompt or "No custom manager prompt provided. Use best orchestration practices."}
+
 Execution budget:
 - max_steps: {current_state["max_steps"]}
 - current_step: {current_state["current_step"]}
 - max_agent_calls: {current_state["max_agent_calls"]}
 - agent_calls_used: {current_state["agent_calls_count"]}
 - agent_calls_remaining: {max(current_state["max_agent_calls"] - current_state["agent_calls_count"], 0)}
+
+Previous plan from last iteration:
+{previous_plan}
+
+Recent execution trace:
+{recent_trace}
 
 Current Conversation History & Knowledge:
 {current_state['conversation_history']}
@@ -2769,14 +3374,19 @@ CRITICAL INSTRUCTIONS FOR LARGE DATA/SCHEMAS:
 4. Do NOT send the entire conversation history to agents. Extract ONLY the relevant context and pass it in the "input" field.
 5. You can update the "scratchpad" to store variables (schema, metrics, intermediate findings).
 6. If you have enough information, return "final_answer" immediately.
+7. For `clickhouse_specific` agents, provide explicit `query_name` and `params` whenever possible.
+8. You MUST re-check and refine your plan every iteration. Include what changed compared with the previous plan.
+9. Never re-dispatch an identical call (same agent + same input + same params context) already attempted before.
 
 Decide the next step. Return ONLY a valid JSON object with the following structure:
 {{
   "status": "thinking" | "calling_agent" | "final_answer",
   "current_plan": "Your updated step-by-step plan based on current knowledge",
+  "plan_revision": "What changed vs previous plan, or why unchanged",
+  "focus_check": "One-line reminder of current objective and open items",
   "rationale": "Why you are making this decision and how it optimizes the plan",
   "scratchpad_updates": {{ "key": "value" }},
-  "calls": [{{"agent_id": 1, "agent_name": "optional fallback", "agent_type": "optional", "input": "highly detailed instruction with only required context"}}],
+  "calls": [{{"agent_id": 1, "agent_name": "optional fallback", "agent_type": "optional", "input": "highly detailed instruction with only required context", "query_name": "optional for clickhouse_specific", "params": {{"P1": "value"}}}}],
   "final_answer": "The comprehensive final answer to the user",
   "missing_information": "Any info you still need to proceed"
 }}"""
@@ -2790,11 +3400,31 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                 if isinstance(updates, dict):
                     current_state["scratchpad"] = {**current_state["scratchpad"], **updates}
 
-                rationale = decision.get("rationale")
-                plan = decision.get("current_plan")
-                add_step({"status": "manager_decision", "rationale": rationale, "plan": plan})
+                rationale = _clip_text(str(decision.get("rationale") or ""), 2000)
+                raw_plan = _clip_text(str(decision.get("current_plan") or ""), 3000)
+                previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 3000)
+                plan = raw_plan or previous_plan or "No explicit plan provided."
+                plan_revision = _clip_text(str(decision.get("plan_revision") or ""), 1200) or _plan_revision_summary(
+                    previous_plan,
+                    plan,
+                )
+                focus_check = _clip_text(str(decision.get("focus_check") or ""), 1200)
+                current_state["current_plan"] = plan
+                current_state["plan_history"].append(plan)
+
+                add_step(
+                    {
+                        "status": "manager_decision",
+                        "rationale": rationale,
+                        "plan": plan,
+                        "plan_revision": plan_revision,
+                        "focus_check": focus_check,
+                    }
+                )
                 current_state["conversation_history"] += (
                     f"\n[Manager Plan Updated]: {plan}\n"
+                    f"[Manager Plan Revision]: {plan_revision}\n"
+                    f"[Manager Focus Check]: {focus_check}\n"
                     f"[Manager Rationale]: {rationale}\n"
                 )
 
@@ -2833,11 +3463,19 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                         unique_calls: List[Dict[str, Any]] = []
                         seen_signatures: set[str] = set()
                         for call in bounded_calls:
+                            call_context = _extract_manager_call_context(call)
+                            context_signature = ""
+                            if len(call_context) > 0:
+                                try:
+                                    context_signature = json.dumps(call_context, sort_keys=True, ensure_ascii=False)
+                                except Exception:
+                                    context_signature = str(call_context)
                             signature = "|".join(
                                 [
                                     str(call.get("agent_id") or ""),
                                     _normalize_identifier(call.get("agent_name") or call.get("agent") or call.get("agent_type")),
                                     str(call.get("input") or "").strip(),
+                                    context_signature,
                                 ]
                             )
                             if signature in seen_signatures:
@@ -2845,7 +3483,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                             seen_signatures.add(signature)
                             unique_calls.append(call)
 
-                        resolved_calls: List[tuple[Dict[str, Any], Dict[str, Any], str, str]] = []
+                        resolved_calls: List[tuple[Dict[str, Any], Dict[str, Any], str, Dict[str, Any], str]] = []
                         for call in unique_calls:
                             selected = _resolve_agent_from_call(call, current_plannable_agents)
                             if selected is None:
@@ -2865,23 +3503,27 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                 )
                                 continue
                             call_input = str(call.get("input") or "").strip() or str(current_state["input"])
+                            call_context = _extract_manager_call_context(call)
                             selected_id = _safe_int(selected.get("id"))
-                            signature = _manager_call_signature(selected_id, call_input)
-                            if signature in current_state["successful_call_signatures"]:
+                            signature = _manager_call_signature(selected_id, call_input, call_context)
+                            if signature in current_state["attempted_call_signatures"]:
                                 add_step(
                                     {
                                         "status": "manager_warning",
                                         "message": (
-                                            "Skipping redundant call because an equivalent successful "
-                                            f"call already exists for agent '{selected.get('name')}'."
+                                            "Skipping duplicate call because an equivalent call context "
+                                            f"was already attempted for agent '{selected.get('name')}'."
                                         ),
                                         "agent": selected.get("name"),
                                         "agent_id": selected_id,
                                         "input": call_input,
+                                        "query_name": call_context.get("query_name"),
+                                        "params": call_context.get("params"),
                                     }
                                 )
                                 continue
-                            resolved_calls.append((call, selected, call_input, signature))
+                            current_state["attempted_call_signatures"].add(signature)
+                            resolved_calls.append((call, selected, call_input, call_context, signature))
 
                         if len(resolved_calls) == 0:
                             add_step(
@@ -2908,6 +3550,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                 call: Dict[str, Any],
                                 selected: Dict[str, Any],
                                 call_input: str,
+                                call_context: Dict[str, Any],
                                 call_signature: str,
                             ) -> str:
                                 selected_id = _safe_int(selected.get("id"))
@@ -2918,6 +3561,8 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                         "agent_id": selected_id,
                                         "agent_type": selected.get("agent_type"),
                                         "input": call_input,
+                                        "query_name": call_context.get("query_name"),
+                                        "params": call_context.get("params"),
                                     }
                                 )
 
@@ -2930,6 +3575,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                         current_state["llm"],
                                         on_step=add_step,
                                         agent_name=selected.get("name") or selected.get("agent_type") or "agent",
+                                        invocation=call_context if len(call_context) > 0 else None,
                                     )
                                     add_step(
                                         {
@@ -2979,8 +3625,8 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
 
                             results = await asyncio.gather(
                                 *(
-                                    execute_call(call, selected, call_input, signature)
-                                    for call, selected, call_input, signature in resolved_calls
+                                    execute_call(call, selected, call_input, call_context, signature)
+                                    for call, selected, call_input, call_context, signature in resolved_calls
                                 )
                             )
                             current_state["conversation_history"] += "".join(results)

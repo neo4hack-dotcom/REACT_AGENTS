@@ -619,6 +619,22 @@ async def get_chat_thread(thread_id: int) -> JSONResponse:
     return JSONResponse(content=thread)
 
 
+@app.post("/api/chat/threads/{thread_id}/clear")
+async def clear_chat_thread(thread_id: int) -> JSONResponse:
+    def mutate(state: Dict[str, Any]) -> bool:
+        thread = _find_thread(state, thread_id)
+        if not thread:
+            return False
+        thread["messages"] = []
+        thread["updated_at"] = _now_iso()
+        return True
+
+    cleared = store.mutate(mutate)
+    if not cleared:
+        return JSONResponse(status_code=404, content={"error": "Thread not found"})
+    return JSONResponse(content={"success": True})
+
+
 @app.delete("/api/chat/threads/{thread_id}")
 async def delete_chat_thread(thread_id: int) -> JSONResponse:
     def mutate(state: Dict[str, Any]) -> None:
