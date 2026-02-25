@@ -631,6 +631,99 @@ def _build_common_feed_candidates(url: str, max_links: int = 8) -> List[str]:
     return deduped
 
 
+def _build_www_url_variants(url: str) -> List[str]:
+    raw = str(url or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+
+    variants: List[str] = []
+    host = parsed.netloc
+    path = parsed.path or "/"
+    suffix = f"{path}{'?' + parsed.query if parsed.query else ''}{'#' + parsed.fragment if parsed.fragment else ''}"
+
+    if host.startswith("www."):
+        no_www = host[4:]
+        variants.append(f"{parsed.scheme}://{no_www}{suffix}")
+    else:
+        variants.append(f"{parsed.scheme}://www.{host}{suffix}")
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        normalized = item.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item)
+    return deduped
+
+
+def _build_google_news_domain_feed_candidates(url: str, max_links: int = 2) -> List[str]:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+    domain = parsed.netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if not domain:
+        return []
+
+    queries = [
+        f"site:{domain}",
+        domain,
+    ]
+    candidates: List[str] = []
+    for query in queries:
+        candidates.append(
+            f"https://news.google.com/rss/search?q={query}&hl=fr&gl=FR&ceid=FR:fr"
+        )
+        candidates.append(
+            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        )
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+        if len(deduped) >= max_links:
+            break
+    return deduped
+
+
+def _build_reader_proxy_candidates(url: str, max_links: int = 2) -> List[str]:
+    raw = str(url or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("https://r.jina.ai/"):
+        return []
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+
+    normalized = f"{parsed.netloc}{parsed.path or '/'}"
+    if parsed.query:
+        normalized += f"?{parsed.query}"
+    candidates = [
+        f"https://r.jina.ai/http://{normalized}",
+        f"https://r.jina.ai/http://{parsed.netloc}",
+    ]
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+        if len(deduped) >= max_links:
+            break
+    return deduped
+
+
 def _build_http_headers(
     *,
     language_hint: str = "en-US,en;q=0.9,fr;q=0.8",
@@ -682,16 +775,37 @@ def _fetch_url_with_fallback(
     prefer_xml: bool = False,
     language_hint: str = "en-US,en;q=0.9,fr;q=0.8",
     allow_common_feed_candidates: bool = False,
+    allow_google_news_fallback: bool = False,
+    allow_reader_proxy_fallback: bool = True,
 ) -> tuple[requests.Response | None, List[str]]:
     raw_url = str(url or "").strip()
     parsed = urlparse(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None, [f"{raw_url} -> invalid_url"]
 
-    root_referer = f"{parsed.scheme}://{parsed.netloc}/"
-    candidates: List[str] = [raw_url]
+    primary_candidates: List[str] = [raw_url]
+    primary_candidates.extend(_build_www_url_variants(raw_url))
     if allow_common_feed_candidates:
-        candidates.extend(_build_common_feed_candidates(raw_url, max_links=8))
+        primary_candidates.extend(_build_common_feed_candidates(raw_url, max_links=8))
+    if allow_google_news_fallback:
+        primary_candidates.extend(_build_google_news_domain_feed_candidates(raw_url, max_links=4))
+
+    proxy_candidates: List[str] = []
+    if allow_reader_proxy_fallback:
+        for candidate in primary_candidates[:6]:
+            proxy_candidates.extend(_build_reader_proxy_candidates(candidate, max_links=2))
+
+    candidates: List[str] = []
+    seen_candidates: set[str] = set()
+    for candidate in [*primary_candidates, *proxy_candidates]:
+        normalized = str(candidate or "").strip()
+        if not normalized:
+            continue
+        key = normalized.rstrip("/")
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        candidates.append(normalized)
 
     tried: set[str] = set()
     failures: List[str] = []
@@ -714,12 +828,18 @@ def _fetch_url_with_fallback(
         if normalized_candidate in tried:
             continue
         tried.add(normalized_candidate)
+        candidate_parsed = urlparse(normalized_candidate)
+        candidate_referer = ""
+        if candidate_parsed.scheme in {"http", "https"} and candidate_parsed.netloc:
+            candidate_referer = f"{candidate_parsed.scheme}://{candidate_parsed.netloc}/"
+        elif parsed.scheme in {"http", "https"} and parsed.netloc:
+            candidate_referer = f"{parsed.scheme}://{parsed.netloc}/"
 
         for ua in user_agents:
             headers = _build_http_headers(
                 language_hint=_resolve_accept_language(language_hint),
                 prefer_xml=prefer_xml,
-                referer=root_referer,
+                referer=candidate_referer,
                 user_agent=ua,
             )
             try:
@@ -813,6 +933,39 @@ def _extract_fallback_links_from_html(
         if len(links) >= max_links:
             break
 
+    return links
+
+
+def _extract_links_from_text_blob(
+    page_url: str,
+    text: str,
+    max_links: int,
+    same_domain_only: bool,
+) -> List[Dict[str, str]]:
+    base_domain = urlparse(page_url).netloc.lower()
+    matches = re.findall(r"https?://[^\s<>\"]+", text or "")
+    links: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in matches:
+        candidate = str(raw or "").strip().strip("<>[](){}\"'")
+        candidate = candidate.rstrip(").,;!?]")
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if same_domain_only and base_domain:
+            target_domain = parsed.netloc.lower()
+            if target_domain and target_domain != base_domain and not target_domain.endswith(f".{base_domain}"):
+                continue
+        normalized = candidate.rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        title = parsed.path.strip("/") or parsed.netloc
+        title = title.replace("-", " ").replace("_", " ")
+        title = " ".join(title.split())[:120] or parsed.netloc
+        links.append({"title": title, "url": candidate})
+        if len(links) >= max_links:
+            break
     return links
 
 
@@ -3008,6 +3161,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     top_k = max(1, min(int(config.get("top_k") or 10), 100))
                     timeout_seconds = max(5, min(int(config.get("timeout_seconds") or 20), 45))
                     language_hint = _resolve_accept_language(config.get("language_hint"))
+                    allow_reader_proxy = bool(config.get("allow_reader_proxy", True))
+                    allow_google_news_fallback = bool(config.get("google_news_fallback", True))
                     interests = [
                         token.strip().lower()
                         for token in str(config.get("interests") or "").split(",")
@@ -3031,6 +3186,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                             prefer_xml=True,
                             language_hint=language_hint,
                             allow_common_feed_candidates=True,
+                            allow_google_news_fallback=allow_google_news_fallback,
+                            allow_reader_proxy_fallback=allow_reader_proxy,
                         )
                         failures.extend(direct_failures[:2])
 
@@ -3056,6 +3213,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                                 prefer_xml=False,
                                 language_hint=language_hint,
                                 allow_common_feed_candidates=False,
+                                allow_google_news_fallback=False,
+                                allow_reader_proxy_fallback=allow_reader_proxy,
                             )
                             failures.extend(html_failures[:1])
                             if html_response is not None:
@@ -3086,6 +3245,10 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
 
                         if len(discovered_feeds) == 0:
                             discovered_feeds = _build_common_feed_candidates(seed_url, max_links=8)
+                            if allow_google_news_fallback:
+                                discovered_feeds.extend(
+                                    _build_google_news_domain_feed_candidates(seed_url, max_links=4)
+                                )
 
                         seen_discovered: set[str] = set()
                         for feed_url in discovered_feeds:
@@ -3100,6 +3263,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                                 prefer_xml=True,
                                 language_hint=language_hint,
                                 allow_common_feed_candidates=False,
+                                allow_google_news_fallback=False,
+                                allow_reader_proxy_fallback=allow_reader_proxy,
                             )
                             failures.extend(feed_failures[:1])
                             if feed_response is None:
@@ -3210,6 +3375,7 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 try:
                     max_chars = int(config.get("max_chars_per_page") or 5000)
                     timeout = int(config.get("timeout_seconds") or 15)
+                    allow_reader_proxy = bool(config.get("allow_reader_proxy", True))
                     scraped = ""
                     failures: List[str] = []
 
@@ -3222,6 +3388,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                                 prefer_xml=False,
                                 language_hint=_resolve_accept_language(config.get("language_hint")),
                                 allow_common_feed_candidates=False,
+                                allow_google_news_fallback=False,
+                                allow_reader_proxy_fallback=allow_reader_proxy,
                             )
                             failures.extend(fetch_failures[:1])
                             if response is None:
@@ -3262,6 +3430,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
             if same_domain_only is None:
                 same_domain_only = True
             same_domain_only = bool(same_domain_only)
+            allow_reader_proxy = bool(config.get("allow_reader_proxy", True))
+            allow_google_news_fallback = bool(config.get("google_news_fallback", True))
 
             if invalid_navigation_urls:
                 _emit_step(
@@ -3319,9 +3489,63 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                         prefer_xml=False,
                         language_hint=language_hint,
                         allow_common_feed_candidates=False,
+                        allow_google_news_fallback=False,
+                        allow_reader_proxy_fallback=allow_reader_proxy,
                     )
                     failures.extend(fetch_failures[:2])
                     if response is None:
+                        fallback_feed_candidates: List[str] = []
+                        fallback_feed_candidates.extend(_build_common_feed_candidates(target_url, max_links=6))
+                        if allow_google_news_fallback:
+                            fallback_feed_candidates.extend(
+                                _build_google_news_domain_feed_candidates(target_url, max_links=4)
+                            )
+                        for feed_url in fallback_feed_candidates:
+                            if len(collected_links) >= item_limit:
+                                break
+                            feed_response, feed_failures = await asyncio.to_thread(
+                                _fetch_url_with_fallback,
+                                feed_url,
+                                timeout_seconds=timeout_seconds,
+                                prefer_xml=True,
+                                language_hint=language_hint,
+                                allow_common_feed_candidates=False,
+                                allow_google_news_fallback=False,
+                                allow_reader_proxy_fallback=allow_reader_proxy,
+                            )
+                            failures.extend(feed_failures[:1])
+                            if feed_response is None:
+                                continue
+                            entries = _extract_feed_entries_from_content(feed_response.content)
+                            if len(entries) == 0:
+                                continue
+                            remaining_from_feed = max(item_limit - len(collected_links), 0)
+                            for entry in entries[:remaining_from_feed]:
+                                mapped = _entry_to_link_item(entry, feed_response.url or feed_url)
+                                if mapped is None:
+                                    continue
+                                mapped_url = mapped["url"]
+                                parsed = urlparse(mapped_url)
+                                if same_domain_only:
+                                    base_domain = urlparse(target_url).netloc.lower()
+                                    target_domain = parsed.netloc.lower()
+                                    if (
+                                        target_domain
+                                        and base_domain
+                                        and target_domain != base_domain
+                                        and not target_domain.endswith(f".{base_domain}")
+                                    ):
+                                        continue
+                                normalized_url = mapped_url.rstrip("/")
+                                if normalized_url in seen_link_urls:
+                                    continue
+                                seen_link_urls.add(normalized_url)
+                                collected_links.append(mapped)
+                                if len(collected_links) >= item_limit:
+                                    break
+                            if len(collected_links) >= item_limit:
+                                break
+
                         _emit_step(
                             on_step,
                             {
@@ -3356,6 +3580,10 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                         feed_candidates = _discover_feed_links_from_html(resolved_url, response.text, max_links=6)
                         if len(feed_candidates) == 0:
                             feed_candidates = _build_common_feed_candidates(resolved_url, max_links=6)
+                            if allow_google_news_fallback:
+                                feed_candidates.extend(
+                                    _build_google_news_domain_feed_candidates(resolved_url, max_links=4)
+                                )
                         for feed_url in feed_candidates:
                             if len(links) >= remaining:
                                 break
@@ -3366,6 +3594,8 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                                 prefer_xml=True,
                                 language_hint=language_hint,
                                 allow_common_feed_candidates=False,
+                                allow_google_news_fallback=False,
+                                allow_reader_proxy_fallback=allow_reader_proxy,
                             )
                             failures.extend(feed_failures[:1])
                             if feed_response is None:
@@ -3392,6 +3622,13 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                                 links.append(mapped)
                                 if len(links) >= remaining:
                                     break
+                    if len(links) == 0 and response.text:
+                        links = _extract_links_from_text_blob(
+                            resolved_url,
+                            response.text,
+                            max_links=remaining,
+                            same_domain_only=same_domain_only,
+                        )
 
                     pruned_links: List[Dict[str, str]] = []
                     for link in links:
