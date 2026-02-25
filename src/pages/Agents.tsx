@@ -101,13 +101,33 @@ const AGENT_TEMPLATES: Record<string, any> = {
     persona: "Careful, systematic, and secure."
   },
   excel_manager: {
-    config: { folder_path: "data/spreadsheets", workbook_path: "data.xlsx", default_sheet: "Sheet1", auto_create_folder: true, auto_create_workbook: false, max_rows_read: 1000 },
+    config: {
+      folder_path: "data/spreadsheets",
+      workbook_path_mode: "auto_in_folder",
+      workbook_path_instruction: "L'IA choisit le classeur selon le contexte en restant dans le dossier configure.",
+      workbook_path: "",
+      default_sheet_mode: "auto_from_context",
+      default_sheet_instruction: "L'IA choisit l'onglet selon le contexte.",
+      default_sheet: "",
+      auto_create_folder: true,
+      auto_create_workbook: true,
+      max_rows_read: 10000
+    },
     role: "Excel Spreadsheet Manager",
     objectives: "Read and manipulate Excel workbooks safely, ensuring valid cell references and data integrity.",
     persona: "Methodical, accurate, and data-focused."
   },
   word_manager: {
-    config: { folder_path: "data/documents", document_path: "report.docx", auto_create_folder: true, auto_create_document: false, allow_overwrite: false, max_paragraphs_read: 100 },
+    config: {
+      folder_path: "data/documents",
+      document_path_mode: "auto_in_folder",
+      document_path_instruction: "L'IA choisit le document tant qu'il reste dans le dossier configure.",
+      document_path: "",
+      auto_create_folder: true,
+      auto_create_document: true,
+      allow_overwrite: true,
+      max_paragraphs_read: 100
+    },
     role: "Word Document Editor",
     objectives: "Read, edit, and generate Word documents, replacing placeholders with concrete content.",
     persona: "Articulate, professional, and formatting-aware."
