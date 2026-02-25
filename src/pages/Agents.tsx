@@ -76,7 +76,7 @@ const AGENT_TEMPLATES: Record<string, any> = {
     persona: "Helpful, context-aware, and precise."
   },
   text_file_manager: {
-    config: { folder_path: "/data/workspace", default_file_path: "output.txt", default_encoding: "utf-8", auto_create_folder: true, allow_overwrite: false, max_chars_read: 10000 },
+    config: { folder_path: "data/workspace", default_file_path: "output.txt", default_encoding: "utf-8", auto_create_folder: true, allow_overwrite: false, max_chars_read: 10000 },
     role: "Text File Operator",
     objectives: "Safely read, create, write, and append text files within a restricted sandbox directory.",
     persona: "Careful, systematic, and secure."

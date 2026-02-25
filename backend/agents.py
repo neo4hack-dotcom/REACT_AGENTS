@@ -352,20 +352,94 @@ def _resolve_workspace_storage_path(raw_path: str, fallback_dir: str | None = No
     return os.path.abspath(os.path.join(base, value))
 
 
-def _resolve_excel_workbook_path(config: Dict[str, Any], workbook_path: str | None = None) -> str:
+def _resolve_managed_root_path(
+    config: Dict[str, Any],
+    *,
+    default_subdir: str,
+) -> str:
     configured_folder = str(config.get("folder_path") or "").strip()
+    default_folder = str(PROJECT_ROOT / default_subdir)
+    if configured_folder:
+        resolved_folder = _resolve_workspace_storage_path(configured_folder, fallback_dir=str(PROJECT_ROOT))
+    else:
+        resolved_folder = os.path.abspath(default_folder)
+    auto_create_folder = bool(config.get("auto_create_folder", True))
+
+    if os.path.exists(resolved_folder):
+        if not os.path.isdir(resolved_folder):
+            raise ValueError(f"Configured folder is not a directory: {resolved_folder}")
+    elif auto_create_folder:
+        os.makedirs(resolved_folder, exist_ok=True)
+    else:
+        raise ValueError(f"Configured folder does not exist: {resolved_folder}")
+
+    return os.path.abspath(resolved_folder)
+
+
+def _to_relative_path(root_path: str, target_path: str) -> str:
+    root = Path(root_path).resolve()
+    target = Path(target_path).resolve()
+    try:
+        relative = target.relative_to(root)
+        text = str(relative)
+        return text if text else "."
+    except Exception:
+        return str(target)
+
+
+def _resolve_safe_managed_file_path(
+    *,
+    root_path: str,
+    raw_path: str,
+    required_suffix: str | None = None,
+    allowed_suffixes: tuple[str, ...] | None = None,
+    allow_outside_folder: bool = False,
+) -> str:
+    resolved_candidate = _resolve_workspace_storage_path(raw_path, fallback_dir=root_path)
+    candidate = Path(resolved_candidate)
+
+    if allowed_suffixes:
+        normalized_allowed = tuple(str(item).lower() for item in allowed_suffixes if item)
+        if not normalized_allowed:
+            normalized_allowed = None
+        if normalized_allowed:
+            if not candidate.suffix:
+                candidate = candidate.with_suffix(normalized_allowed[0])
+            elif candidate.suffix.lower() not in normalized_allowed:
+                joined = ", ".join(normalized_allowed)
+                raise ValueError(f"Expected one of ({joined}) file extensions: {candidate}")
+    elif required_suffix:
+        normalized_suffix = required_suffix.lower()
+        if not candidate.suffix:
+            candidate = candidate.with_suffix(normalized_suffix)
+        elif candidate.suffix.lower() != normalized_suffix:
+            raise ValueError(f"Expected a '{normalized_suffix}' file path: {candidate}")
+
+    resolved = candidate.resolve()
+    root = Path(root_path).resolve()
+    if not allow_outside_folder:
+        try:
+            resolved.relative_to(root)
+        except Exception as exc:
+            raise ValueError(f"Path '{resolved}' is outside the configured folder '{root}'.") from exc
+
+    return str(resolved)
+
+
+def _resolve_excel_workbook_path(config: Dict[str, Any], workbook_path: str | None = None) -> str:
     configured_workbook = str(config.get("workbook_path") or "").strip()
     requested_workbook = str(workbook_path or "").strip()
-
-    default_folder = str(PROJECT_ROOT / "data" / "spreadsheets")
-    resolved_folder = _resolve_workspace_storage_path(configured_folder, fallback_dir=default_folder)
+    root_path = _resolve_managed_root_path(config, default_subdir="data/spreadsheets")
     raw_path = requested_workbook or configured_workbook or "data.xlsx"
-    resolved = _resolve_workspace_storage_path(raw_path, fallback_dir=resolved_folder)
-
+    resolved = _resolve_safe_managed_file_path(
+        root_path=root_path,
+        raw_path=raw_path,
+        allowed_suffixes=(".xlsx", ".xlsm", ".xltx", ".xltm"),
+        allow_outside_folder=bool(config.get("allow_outside_folder")),
+    )
+    parent = os.path.dirname(resolved) or root_path
     if bool(config.get("auto_create_folder", True)):
-        parent = os.path.dirname(resolved) or resolved_folder
         os.makedirs(parent, exist_ok=True)
-
     return resolved
 
 
@@ -847,19 +921,19 @@ async def _execute_excel_actions(
 
 
 def _resolve_word_document_path(config: Dict[str, Any], document_path: str | None = None) -> str:
-    configured_folder = str(config.get("folder_path") or "").strip()
     configured_document = str(config.get("document_path") or "").strip()
     requested_document = str(document_path or "").strip()
-
-    default_folder = str(PROJECT_ROOT / "data" / "documents")
-    resolved_folder = _resolve_workspace_storage_path(configured_folder, fallback_dir=default_folder)
+    root_path = _resolve_managed_root_path(config, default_subdir="data/documents")
     raw_path = requested_document or configured_document or "report.docx"
-    resolved = _resolve_workspace_storage_path(raw_path, fallback_dir=resolved_folder)
-
+    resolved = _resolve_safe_managed_file_path(
+        root_path=root_path,
+        raw_path=raw_path,
+        allowed_suffixes=(".docx", ".docm", ".dotx", ".dotm"),
+        allow_outside_folder=bool(config.get("allow_outside_folder")),
+    )
+    parent = os.path.dirname(resolved) or root_path
     if bool(config.get("auto_create_folder", True)):
-        parent = os.path.dirname(resolved) or resolved_folder
         os.makedirs(parent, exist_ok=True)
-
     return resolved
 
 
@@ -1305,6 +1379,429 @@ async def _execute_word_actions(
     }
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _looks_like_file_path(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if "/" in text or "\\" in text:
+        return True
+    return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", text))
+
+
+def _resolve_text_file_path(config: Dict[str, Any], file_path: str | None = None) -> tuple[str, str]:
+    root_path = _resolve_managed_root_path(config, default_subdir="data/workspace")
+    configured_path = str(config.get("default_file_path") or "").strip()
+    requested_path = str(file_path or "").strip()
+    raw_path = requested_path or configured_path or "output.txt"
+    resolved = _resolve_safe_managed_file_path(
+        root_path=root_path,
+        raw_path=raw_path,
+        allow_outside_folder=_coerce_bool(config.get("allow_outside_folder"), default=False),
+    )
+    return root_path, resolved
+
+
+def _guess_text_file_path_from_text(text: str) -> str | None:
+    quoted = re.search(
+        r"[\"']([^\"']+\.(?:txt|md|csv|json|log|yaml|yml|ini|cfg|conf|xml|html|py|js|ts))[\"']",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if quoted:
+        return str(quoted.group(1)).strip()
+
+    bare = re.search(
+        r"([A-Za-z]:[\\/][^\s\"']+\.(?:txt|md|csv|json|log|yaml|yml|ini|cfg|conf|xml|html|py|js|ts)|\.{0,2}[\\/][^\s\"']+\.(?:txt|md|csv|json|log|yaml|yml|ini|cfg|conf|xml|html|py|js|ts)|[A-Za-z0-9._/-]+\.(?:txt|md|csv|json|log|yaml|yml|ini|cfg|conf|xml|html|py|js|ts))",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if bare:
+        return str(bare.group(1)).strip()
+    return None
+
+
+def _guess_text_content_from_text(text: str) -> str:
+    quoted_values = [str(item).strip() for item in re.findall(r"[\"']([^\"']+)[\"']", text or "")]
+    filtered = [item for item in quoted_values if item and not _looks_like_file_path(item)]
+    if filtered:
+        return filtered[-1]
+
+    colon_match = re.search(r"[:：]\s*(.+)$", text or "", flags=re.IGNORECASE)
+    if colon_match:
+        return str(colon_match.group(1)).strip()
+    return ""
+
+
+def _normalize_text_action_payload(action: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = dict(action)
+    raw_action_name = str(normalized.get("action") or normalized.get("operation") or "").strip().lower()
+    action_aliases = {
+        "create": "create_file",
+        "new_file": "create_file",
+        "delete": "delete_file",
+        "remove": "delete_file",
+        "read": "read_file",
+        "write": "write_file",
+        "append": "append_file",
+        "list": "list_files",
+    }
+    normalized["action"] = action_aliases.get(raw_action_name, raw_action_name)
+
+    if normalized.get("file_path") in (None, ""):
+        for key in ("file", "path", "target_path", "filename"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized["file_path"] = value.strip()
+                break
+
+    if normalized.get("content") is None:
+        for key in ("text", "value", "body", "data"):
+            if key in normalized and normalized.get(key) is not None:
+                normalized["content"] = normalized.get(key)
+                break
+
+    if normalized.get("pattern") in (None, "") and normalized.get("filter") not in (None, ""):
+        normalized["pattern"] = normalized.get("filter")
+
+    return normalized
+
+
+def _normalize_text_file_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    *,
+    allow_heuristics: bool = True,
+) -> List[Dict[str, Any]] | None:
+    parsed = _extract_possible_json(user_input)
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("actions"), list):
+            actions = [_normalize_text_action_payload(item) for item in parsed["actions"] if isinstance(item, dict)]
+            return actions if actions else None
+        if isinstance(parsed.get("action"), str) or isinstance(parsed.get("operation"), str):
+            return [_normalize_text_action_payload(parsed)]
+    if isinstance(parsed, list):
+        actions = [_normalize_text_action_payload(item) for item in parsed if isinstance(item, dict)]
+        if actions:
+            return actions
+
+    if not allow_heuristics:
+        return None
+
+    text = (user_input or "").strip()
+    lowered = text.lower()
+    guessed_path = _guess_text_file_path_from_text(text)
+    guessed_content = _guess_text_content_from_text(text)
+
+    heuristics: List[Dict[str, Any]] = []
+
+    def add_action(action: Dict[str, Any]) -> None:
+        if guessed_path and not action.get("file_path"):
+            action["file_path"] = guessed_path
+        heuristics.append(_normalize_text_action_payload(action))
+
+    if re.search(r"(list|liste|show|affiche).*(files?|fichiers?)", lowered):
+        add_action({"action": "list_files"})
+    elif re.search(r"(delete|remove|supprime|supprimer).*(files?|fichiers?)", lowered):
+        add_action({"action": "delete_file"})
+    elif re.search(r"(create|new|cr[eé]e|créer).*(files?|fichiers?)", lowered):
+        payload: Dict[str, Any] = {"action": "create_file"}
+        if guessed_content:
+            payload["content"] = guessed_content
+        add_action(payload)
+    elif re.search(r"(read|lire|open|ouvre|affiche).*(files?|fichiers?)", lowered):
+        add_action({"action": "read_file", "max_chars": int(config.get("max_chars_read") or 10000)})
+    elif re.search(r"(append|ajoute|ajouter).*(text|texte|files?|fichiers?)", lowered):
+        if guessed_content:
+            add_action({"action": "append_file", "content": guessed_content})
+    elif re.search(r"(write|ecris|écris|modifie|modifier|replace).*(files?|fichiers?|text|texte)", lowered):
+        if guessed_content:
+            add_action({"action": "write_file", "content": guessed_content})
+
+    return heuristics if heuristics else None
+
+
+async def _execute_text_file_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    on_step: StepCallback | None,
+    agent_label: str,
+    *,
+    allow_heuristics: bool = True,
+) -> AgentResult | None:
+    actions = _normalize_text_file_actions(user_input, config, allow_heuristics=allow_heuristics)
+    if not actions:
+        return None
+
+    default_encoding = str(config.get("default_encoding") or "utf-8").strip() or "utf-8"
+    allow_overwrite = _coerce_bool(config.get("allow_overwrite"), default=True)
+    max_chars_read = _coerce_int(config.get("max_chars_read"), default=10000, minimum=200, maximum=500000)
+
+    operation_logs: List[Dict[str, Any]] = []
+    listed_files: List[Dict[str, Any]] = []
+    preview_by_file: Dict[str, str] = {}
+    root_path_cache = ""
+    file_path_cache = ""
+
+    for action in actions:
+        action_name = str(action.get("action") or "").strip().lower()
+        raw_file_path = str(action.get("file_path") or "").strip()
+        resolved_file_path = ""
+
+        try:
+            if action_name == "list_files":
+                root_path = _resolve_managed_root_path(config, default_subdir="data/workspace")
+                root_path_cache = root_path
+                target_path = root_path
+                if raw_file_path:
+                    target_path = _resolve_safe_managed_file_path(
+                        root_path=root_path,
+                        raw_path=raw_file_path,
+                        allow_outside_folder=_coerce_bool(config.get("allow_outside_folder"), default=False),
+                    )
+                resolved_file_path = target_path
+            else:
+                root_path, resolved_file_path = _resolve_text_file_path(config, raw_file_path or None)
+                root_path_cache = root_path
+                file_path_cache = resolved_file_path
+        except Exception as exc:
+            return {
+                "answer": f"Unable to resolve text-file path: {exc}",
+                "details": {"action": action_name, "requested_file_path": raw_file_path},
+            }
+
+        _emit_step(
+            on_step,
+            {
+                "status": "text_action_started",
+                "agent": agent_label,
+                "action": action_name,
+                "file_path": resolved_file_path,
+            },
+        )
+
+        if action_name == "list_files":
+            recursive = _coerce_bool(action.get("recursive"), default=False)
+            pattern = str(action.get("pattern") or "").strip().lower()
+            entries: List[Dict[str, Any]] = []
+
+            if os.path.isfile(resolved_file_path):
+                entries = [
+                    {
+                        "path": _to_relative_path(root_path_cache, resolved_file_path),
+                        "size_bytes": os.path.getsize(resolved_file_path),
+                    }
+                ]
+            elif os.path.isdir(resolved_file_path):
+                iterator = Path(resolved_file_path).rglob("*") if recursive else Path(resolved_file_path).glob("*")
+                for item in iterator:
+                    if not item.is_file():
+                        continue
+                    relative = _to_relative_path(root_path_cache, str(item))
+                    if pattern and pattern not in relative.lower():
+                        continue
+                    entries.append({"path": relative, "size_bytes": item.stat().st_size})
+                    if len(entries) >= 500:
+                        break
+            else:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Target path does not exist.",
+                        "file_path": resolved_file_path,
+                    }
+                )
+                continue
+
+            listed_files = entries
+            operation_logs.append(
+                {
+                    "action": action_name,
+                    "status": "ok",
+                    "listed_files": len(entries),
+                    "target": _to_relative_path(root_path_cache, resolved_file_path),
+                }
+            )
+            _emit_step(
+                on_step,
+                {
+                    "status": "text_action_completed",
+                    "agent": agent_label,
+                    "action": action_name,
+                    "listed_files": len(entries),
+                },
+            )
+            continue
+
+        if action_name == "read_file":
+            if not os.path.exists(resolved_file_path) or not os.path.isfile(resolved_file_path):
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "File does not exist.",
+                        "file_path": resolved_file_path,
+                    }
+                )
+                continue
+
+            max_chars = _coerce_int(action.get("max_chars"), default=max_chars_read, minimum=200, maximum=500000)
+            content = Path(resolved_file_path).read_text(encoding=default_encoding, errors="ignore")
+            preview = content[:max_chars]
+            if len(content) > max_chars:
+                preview += "\n...[truncated]"
+            relative = _to_relative_path(root_path_cache, resolved_file_path)
+            preview_by_file[relative] = preview
+            operation_logs.append(
+                {
+                    "action": action_name,
+                    "status": "ok",
+                    "file_path": relative,
+                    "chars_read": len(content),
+                }
+            )
+            _emit_step(
+                on_step,
+                {
+                    "status": "text_action_completed",
+                    "agent": agent_label,
+                    "action": action_name,
+                    "file_path": relative,
+                },
+            )
+            continue
+
+        content = str(action.get("content") or "")
+        target = Path(resolved_file_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        relative_path = _to_relative_path(root_path_cache, resolved_file_path)
+
+        if action_name == "create_file":
+            if target.exists() and not allow_overwrite:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "File already exists and overwrite is disabled.",
+                        "file_path": relative_path,
+                    }
+                )
+            else:
+                if content:
+                    target.write_text(content, encoding=default_encoding)
+                else:
+                    target.touch(exist_ok=True)
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "ok",
+                        "file_path": relative_path,
+                        "chars_written": len(content),
+                    }
+                )
+        elif action_name == "write_file":
+            if target.exists() and not allow_overwrite:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Overwrite disabled.",
+                        "file_path": relative_path,
+                    }
+                )
+            else:
+                target.write_text(content, encoding=default_encoding)
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "ok",
+                        "file_path": relative_path,
+                        "chars_written": len(content),
+                    }
+                )
+        elif action_name == "append_file":
+            prefix = ""
+            if _coerce_bool(action.get("prepend_newline"), default=False) and target.exists() and target.stat().st_size > 0:
+                prefix = "\n"
+            with target.open("a", encoding=default_encoding) as handle:
+                handle.write(prefix + content)
+            operation_logs.append(
+                {
+                    "action": action_name,
+                    "status": "ok",
+                    "file_path": relative_path,
+                    "chars_appended": len(prefix + content),
+                }
+            )
+        elif action_name == "delete_file":
+            if target.exists():
+                target.unlink()
+                operation_logs.append({"action": action_name, "status": "ok", "file_path": relative_path})
+            else:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "File does not exist.",
+                        "file_path": relative_path,
+                    }
+                )
+        else:
+            operation_logs.append({"action": action_name, "status": "skipped", "reason": "Unsupported action."})
+
+        _emit_step(
+            on_step,
+            {
+                "status": "text_action_completed",
+                "agent": agent_label,
+                "action": action_name,
+                "file_path": relative_path,
+            },
+        )
+
+    summary_parts = [f"{len(operation_logs)} action(s) processed"]
+    if root_path_cache:
+        summary_parts.append(f"folder={root_path_cache}")
+    if file_path_cache:
+        summary_parts.append(f"file={file_path_cache}")
+    if listed_files:
+        summary_parts.append(f"listed_files={len(listed_files)}")
+    if preview_by_file:
+        summary_parts.append(f"files_read={len(preview_by_file)}")
+
+    return {
+        "answer": "Text file operations completed: " + " | ".join(summary_parts),
+        "details": {
+            "folder_path": root_path_cache,
+            "file_path": file_path_cache,
+            "operations": operation_logs,
+            "listed_files": listed_files[:500],
+            "previews": preview_by_file,
+        },
+    }
+
+
 def build_agent_execution_config(agent: Dict[str, Any]) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
     raw_config = agent.get("config")
@@ -1581,11 +2078,26 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 except Exception as exc:
                     extra_context = f"\n\nError reading directory: {exc}"
         elif agent_type == "text_file_manager":
+            text_result = await _execute_text_file_actions(user_input, config, on_step, agent_label)
+            if text_result is not None:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "Text file operations executed.",
+                    },
+                )
+                return text_result
+
             system_prompt = (
                 f"You are a Text File Manager. Folder: {config.get('folder_path')}. Allow overwrite: "
                 f"{bool(config.get('allow_overwrite'))}.\n"
-                "Return your response in JSON format: { \"answer\": \"File operations completed.\", "
-                "\"details\": {\"action\": \"read|write|append\", \"file\": \"filename\"} }"
+                "If the user asks to list/create/read/write/append/delete files, return JSON actions using this schema:\n"
+                "{ \"actions\": [ {\"action\": \"list_files|create_file|read_file|write_file|append_file|delete_file\", "
+                "\"file_path\": \"optional\", \"content\": \"optional\", \"max_chars\": 10000, \"recursive\": false, "
+                "\"pattern\": \"optional\", \"prepend_newline\": false } ] }\n"
+                "Otherwise return your response in JSON format: { \"answer\": \"File operations completed.\" }"
             )
         elif agent_type == "excel_manager":
             excel_result = await _execute_excel_actions(user_input, config, on_step, agent_label)
@@ -1920,6 +2432,24 @@ Instructions: {config.get('system_prompt') or ''}"""
                         },
                     )
                     return excel_llm_result
+            if agent_type == "text_file_manager":
+                text_llm_result = await _execute_text_file_actions(
+                    content,
+                    config,
+                    on_step,
+                    agent_label,
+                    allow_heuristics=False,
+                )
+                if text_llm_result is not None:
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "agent_completed",
+                            "agent": agent_label,
+                            "message": "Text file operations executed.",
+                        },
+                    )
+                    return text_llm_result
             if agent_type == "word_manager":
                 word_llm_result = await _execute_word_actions(
                     content,
@@ -2004,6 +2534,63 @@ Instructions: {config.get('system_prompt') or ''}"""
             return {"answer": f"Error executing agent: {exc}"}
 
 
+def _runtime_unavailable_reason_for_agent(agent: Dict[str, Any]) -> str | None:
+    agent_type = str(agent.get("agent_type") or "").strip().lower()
+    config = build_agent_execution_config(agent)
+
+    if agent_type == "excel_manager":
+        try:
+            import openpyxl  # type: ignore  # noqa: F401
+        except Exception:
+            return "Dependency missing: openpyxl is required."
+
+    if agent_type == "word_manager":
+        try:
+            from docx import Document  # type: ignore  # noqa: F401
+        except Exception:
+            return "Dependency missing: python-docx is required."
+
+    if agent_type == "elasticsearch_retriever":
+        if not str(config.get("base_url") or "").strip() or not str(config.get("index") or "").strip():
+            return "Missing Elasticsearch configuration (base_url/index)."
+
+    return None
+
+
+def _collect_runtime_unavailable_agents(agents: List[Dict[str, Any]]) -> Dict[int, str]:
+    unavailable: Dict[int, str] = {}
+    for agent in agents:
+        reason = _runtime_unavailable_reason_for_agent(agent)
+        if not reason:
+            continue
+        agent_id = _safe_int(agent.get("id"))
+        if agent_id is None:
+            continue
+        unavailable[agent_id] = reason
+    return unavailable
+
+
+def _normalize_manager_call_input(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    return normalized[:600]
+
+
+def _manager_call_signature(agent_id: int | None, call_input: str) -> str:
+    return f"{agent_id or 0}|{_normalize_manager_call_input(call_input)}"
+
+
+def _should_mark_agent_unavailable(error_text: str) -> bool:
+    normalized = str(error_text or "").lower()
+    permanent_markers = (
+        "requires the `openpyxl` dependency",
+        "requires the `python-docx` dependency",
+        "no module named",
+        "dependency missing",
+        "unsupported llm provider",
+    )
+    return any(marker in normalized for marker in permanent_markers)
+
+
 class ManagerState(TypedDict):
     input: str
     active_agents: List[Dict[str, Any]]
@@ -2018,6 +2605,8 @@ class ManagerState(TypedDict):
     max_steps: int
     done: bool
     final_answer: str
+    unavailable_agents: Dict[int, str]
+    successful_call_signatures: set[str]
 
 
 class MultiAgentManager:
@@ -2031,6 +2620,10 @@ class MultiAgentManager:
     ) -> Dict[str, Any]:
         cfg = manager_config or {}
         active_agents = [agent for agent in agents if agent.get("agent_type") != "manager"]
+        unavailable_agents = _collect_runtime_unavailable_agents(active_agents)
+        plannable_agents = [
+            agent for agent in active_agents if _safe_int(agent.get("id")) not in unavailable_agents
+        ]
 
         state: ManagerState = {
             "input": user_input,
@@ -2046,6 +2639,8 @@ class MultiAgentManager:
             "max_steps": int(cfg.get("max_steps") or 10),
             "done": False,
             "final_answer": "",
+            "unavailable_agents": unavailable_agents,
+            "successful_call_signatures": set(),
         }
 
         def add_step(step: Dict[str, Any]) -> None:
@@ -2058,6 +2653,17 @@ class MultiAgentManager:
                 "status": "manager_start",
                 "message": "Starting multi-agent orchestration",
                 "active_agents": len(active_agents),
+                "plannable_agents": len(plannable_agents),
+                "unavailable_agents": [
+                    {
+                        "id": agent.get("id"),
+                        "name": agent.get("name"),
+                        "agent_type": agent.get("agent_type"),
+                        "reason": unavailable_agents.get(_safe_int(agent.get("id")) or -1),
+                    }
+                    for agent in active_agents
+                    if (_safe_int(agent.get("id")) or -1) in unavailable_agents
+                ],
                 "max_steps": state["max_steps"],
                 "max_agent_calls": state["max_agent_calls"],
             }
@@ -2079,6 +2685,36 @@ class MultiAgentManager:
                 current_state["done"] = True
                 return current_state
 
+            current_plannable_agents = [
+                agent
+                for agent in current_state["active_agents"]
+                if _safe_int(agent.get("id")) not in current_state["unavailable_agents"]
+            ]
+            if len(current_plannable_agents) == 0:
+                current_state["final_answer"] = (
+                    "No runnable agents are currently available. "
+                    "Fix dependencies/configuration and retry."
+                )
+                add_step(
+                    {
+                        "status": "manager_final",
+                        "answer": current_state["final_answer"],
+                        "manager_summary": "All worker agents are unavailable at runtime.",
+                        "unavailable_agents": [
+                            {
+                                "id": agent.get("id"),
+                                "name": agent.get("name"),
+                                "agent_type": agent.get("agent_type"),
+                                "reason": current_state["unavailable_agents"].get(_safe_int(agent.get("id")) or -1),
+                            }
+                            for agent in current_state["active_agents"]
+                            if (_safe_int(agent.get("id")) or -1) in current_state["unavailable_agents"]
+                        ],
+                    }
+                )
+                current_state["done"] = True
+                return current_state
+
             if current_state["current_step"] >= current_state["max_steps"]:
                 current_state["final_answer"] = "Reached maximum steps without a final answer."
                 add_step(
@@ -2091,10 +2727,23 @@ class MultiAgentManager:
                 current_state["done"] = True
                 return current_state
 
-            agent_catalog = [_agent_catalog_entry(agent) for agent in current_state["active_agents"]]
+            agent_catalog = [_agent_catalog_entry(agent) for agent in current_plannable_agents]
+            unavailable_summary = [
+                {
+                    "id": agent.get("id"),
+                    "name": agent.get("name"),
+                    "agent_type": agent.get("agent_type"),
+                    "reason": current_state["unavailable_agents"].get(_safe_int(agent.get("id")) or -1),
+                }
+                for agent in current_state["active_agents"]
+                if (_safe_int(agent.get("id")) or -1) in current_state["unavailable_agents"]
+            ]
             manager_prompt = f"""You are an advanced Multi-Agent Orchestrator.
-Available agents catalog (always use agent_id when possible):
+Available agents catalog (always use agent_id when possible and only choose from this list):
 {json.dumps(agent_catalog, ensure_ascii=False, indent=2)}
+
+Unavailable agents (DO NOT CALL):
+{json.dumps(unavailable_summary, ensure_ascii=False, indent=2)}
 
 Execution budget:
 - max_steps: {current_state["max_steps"]}
@@ -2196,9 +2845,9 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                             seen_signatures.add(signature)
                             unique_calls.append(call)
 
-                        resolved_calls: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+                        resolved_calls: List[tuple[Dict[str, Any], Dict[str, Any], str, str]] = []
                         for call in unique_calls:
-                            selected = _resolve_agent_from_call(call, current_state["active_agents"])
+                            selected = _resolve_agent_from_call(call, current_plannable_agents)
                             if selected is None:
                                 add_step(
                                     {
@@ -2210,12 +2859,29 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                                 "name": agent.get("name"),
                                                 "agent_type": agent.get("agent_type"),
                                             }
-                                            for agent in current_state["active_agents"]
+                                            for agent in current_plannable_agents
                                         ],
                                     }
                                 )
                                 continue
-                            resolved_calls.append((call, selected))
+                            call_input = str(call.get("input") or "").strip() or str(current_state["input"])
+                            selected_id = _safe_int(selected.get("id"))
+                            signature = _manager_call_signature(selected_id, call_input)
+                            if signature in current_state["successful_call_signatures"]:
+                                add_step(
+                                    {
+                                        "status": "manager_warning",
+                                        "message": (
+                                            "Skipping redundant call because an equivalent successful "
+                                            f"call already exists for agent '{selected.get('name')}'."
+                                        ),
+                                        "agent": selected.get("name"),
+                                        "agent_id": selected_id,
+                                        "input": call_input,
+                                    }
+                                )
+                                continue
+                            resolved_calls.append((call, selected, call_input, signature))
 
                         if len(resolved_calls) == 0:
                             add_step(
@@ -2238,16 +2904,18 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                 }
                             )
 
-                            async def execute_call(call: Dict[str, Any], selected: Dict[str, Any]) -> str:
-                                call_input = str(call.get("input") or "").strip()
-                                if not call_input:
-                                    call_input = str(current_state["input"])
-
+                            async def execute_call(
+                                call: Dict[str, Any],
+                                selected: Dict[str, Any],
+                                call_input: str,
+                                call_signature: str,
+                            ) -> str:
+                                selected_id = _safe_int(selected.get("id"))
                                 add_step(
                                     {
                                         "status": "agent_call_started",
                                         "agent": selected.get("name"),
-                                        "agent_id": selected.get("id"),
+                                        "agent_id": selected_id,
                                         "agent_type": selected.get("agent_type"),
                                         "input": call_input,
                                     }
@@ -2267,26 +2935,53 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                         {
                                             "status": "agent_call_completed",
                                             "agent": selected.get("name"),
-                                            "agent_id": selected.get("id"),
+                                            "agent_id": selected_id,
                                             "result": result,
                                         }
                                     )
                                     if result.get("sql"):
                                         add_step({"status": "sql_generated", "sql": result["sql"]})
+                                    answer_text = str(result.get("answer") or "").strip()
+                                    if answer_text:
+                                        current_state["successful_call_signatures"].add(call_signature)
+                                    if _should_mark_agent_unavailable(answer_text) and selected_id is not None:
+                                        current_state["unavailable_agents"][selected_id] = answer_text[:500]
+                                        add_step(
+                                            {
+                                                "status": "agent_marked_unavailable",
+                                                "agent": selected.get("name"),
+                                                "agent_id": selected_id,
+                                                "reason": answer_text,
+                                            }
+                                        )
                                     return f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n"
                                 except Exception as exc:
+                                    error_text = str(exc)
                                     add_step(
                                         {
                                             "status": "agent_call_failed",
                                             "agent": selected.get("name"),
-                                            "agent_id": selected.get("id"),
-                                            "error": str(exc),
+                                            "agent_id": selected_id,
+                                            "error": error_text,
                                         }
                                     )
+                                    if _should_mark_agent_unavailable(error_text) and selected_id is not None:
+                                        current_state["unavailable_agents"][selected_id] = error_text[:500]
+                                        add_step(
+                                            {
+                                                "status": "agent_marked_unavailable",
+                                                "agent": selected.get("name"),
+                                                "agent_id": selected_id,
+                                                "reason": error_text,
+                                            }
+                                        )
                                     return f"\nAgent {selected.get('name')} failed: {exc}\n"
 
                             results = await asyncio.gather(
-                                *(execute_call(call, selected) for call, selected in resolved_calls)
+                                *(
+                                    execute_call(call, selected, call_input, signature)
+                                    for call, selected, call_input, signature in resolved_calls
+                                )
                             )
                             current_state["conversation_history"] += "".join(results)
                 else:
