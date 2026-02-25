@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { Save, Trash2, Database, Cpu, Play, CheckCircle2 } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
 
 export default function Configuration() {
   const [llmConfig, setLlmConfig] = useState({ provider: 'ollama', base_url: 'http://localhost:11434', model_name: 'llama3', api_key: '' });
@@ -11,18 +10,16 @@ export default function Configuration() {
   const [dbConfigs, setDbConfigs] = useState<any[]>([]);
   const [newDb, setNewDb] = useState({ type: 'clickhouse', host: '', port: 8123, username: '', password: '', database_name: '' });
   const [testingDb, setTestingDb] = useState(false);
-  const { token } = useAuth();
 
   useEffect(() => {
-    if (token) fetchConfigs();
-  }, [token]);
+    fetchConfigs();
+  }, []);
 
   const fetchConfigs = async () => {
     try {
-      const headers = { Authorization: `Bearer ${token}` };
       const [llmRes, dbRes] = await Promise.all([
-        fetch('/api/config/llm', { headers }),
-        fetch('/api/config/db', { headers })
+        fetch('/api/config/llm'),
+        fetch('/api/config/db')
       ]);
       const llm = await llmRes.json();
       const dbs = await dbRes.json();
@@ -36,7 +33,7 @@ export default function Configuration() {
   const saveLlmConfig = async () => {
     await fetch('/api/config/llm', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(llmConfig)
     });
     alert('LLM Configuration saved!');
@@ -48,7 +45,7 @@ export default function Configuration() {
     try {
       const res = await fetch('/api/config/llm/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: llmConfig.provider, base_url: llmConfig.base_url, api_key: llmConfig.api_key })
       });
       const data = await res.json();
@@ -75,7 +72,7 @@ export default function Configuration() {
     try {
       const res = await fetch('/api/config/db/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newDb)
       });
       const data = await res.json();
@@ -96,7 +93,7 @@ export default function Configuration() {
     try {
       const res = await fetch('/api/config/db', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newDb)
       });
       if (!res.ok) {
@@ -113,8 +110,7 @@ export default function Configuration() {
 
   const deleteDbConfig = async (id: number) => {
     await fetch(`/api/config/db/${id}`, { 
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` }
+      method: 'DELETE'
     });
     fetchConfigs();
   };

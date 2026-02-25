@@ -1,20 +1,137 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# AI Data Agents
 
-# Run and deploy your AI Studio app
+Application multi-agents avec interface React et backend Python.
 
-This contains everything you need to run your app locally.
+- Frontend: React + Vite
+- Backend: FastAPI + LangChain + LangGraph
+- Stockage: fichier `DB.json` (pas de SQLite)
+- Authentification: désactivée (accès direct à l'application)
 
-View your app in AI Studio: https://ai.studio/apps/5034a999-1b40-4c47-a3fa-a2f3147a4ef5
+## Objectif du projet
 
-## Run Locally
+AI Data Agents permet de:
 
-**Prerequisites:**  Node.js
+- configurer un LLM (Ollama local ou endpoint HTTP compatible OpenAI)
+- créer des agents spécialisés à partir de templates
+- configurer des connexions de données
+- discuter avec un agent unique ou un orchestrateur multi-agents
+- suivre les étapes d'exécution en streaming (SSE)
 
+## Architecture
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- `src/`: frontend React (pages Dashboard, Agents, Configuration, Chat)
+- `backend/main.py`: API FastAPI et orchestration des routes métier
+- `backend/agents.py`: exécution des agents + manager LangGraph
+- `DB.json`: persistance des configurations et agents
+
+## Liste des agents
+
+Les agents disponibles dans l'interface (type + description):
+
+| Type | Nom affiché | Description |
+|---|---|---|
+| `custom` | Custom Agent | Assistant généraliste configurable librement (rôle, objectifs, persona, prompt). |
+| `manager` | Agent Manager (Orchestrator) | Orchestrateur multi-agents qui planifie, délègue et synthétise une réponse finale. |
+| `sql_analyst` | SQL Analyst | Traduit des demandes en SQL ClickHouse optimisé et explique les résultats. |
+| `clickhouse_table_manager` | ClickHouse Table Manager | Administre les tables ClickHouse avec garde-fous de sécurité. |
+| `clickhouse_writer` | ClickHouse Writer | Crée des tables temporaires et écrit des données en imposant le préfixe `agent_`. |
+| `unstructured_to_structured` | Unstructured to Structured | Extrait du JSON structuré depuis du texte non structuré selon un schéma. |
+| `email_cleaner` | Email Cleaner | Résume des emails bruyants en sections actionnables et concises. |
+| `file_assistant` | File Assistant | Répond à partir de fichiers locaux fournis (mode RAG léger sur fichiers). |
+| `text_file_manager` | Text File Manager | Lit/écrit/ajoute du texte dans un dossier sandboxé. |
+| `excel_manager` | Excel Manager | Lit et manipule des classeurs Excel en respectant l'intégrité des données. |
+| `word_manager` | Word Manager | Lit/édite/génère des documents Word avec remplacement de contenu. |
+| `elasticsearch_retriever` | Elasticsearch Retriever | Récupère des documents Elasticsearch et synthétise une réponse. |
+| `rag_context` | RAG Context | Produit des réponses basées sur des chunks récupérés d'une base documentaire locale. |
+| `rss_news` | RSS News | Agrège et filtre des flux RSS/Atom pour un briefing d'actualité pertinent. |
+| `web_scraper` | Web Scraper | Extrait et synthétise du contenu web depuis des URLs de départ. |
+| `web_navigator` | Web Navigator | Agent de navigation web multi-étapes (interactions web). |
+| `knowledge_base_assistant` | Concierge Interne (Knowledge Base) | Assistant interne RAG avec citations et politique anti-hallucination. |
+| `data_anomaly_hunter` | Chasseur d'Anomalies (Anomaly Hunter) | Interprète des anomalies statistiques et formule des alertes métier. |
+| `text_to_sql_translator` | Traducteur Métier (Text-to-SQL) | Convertit des questions métier en SQL ClickHouse robuste avec auto-correction. |
+| `data_profiler_cleaner` | Profilage et Nettoyage (Data Profiler) | Analyse la qualité des données et propose des scripts de nettoyage. |
+
+## Lancer l'application en local sur Windows
+
+### 1) Prérequis
+
+- Windows 10/11
+- [Node.js 20+](https://nodejs.org/)
+- [Python 3.11+](https://www.python.org/downloads/windows/)
+- Git (optionnel mais recommandé)
+- Optionnel: Ollama si vous utilisez le provider local (`ollama`)
+
+### 2) Ouvrir un terminal dans le projet
+
+PowerShell:
+
+```powershell
+cd C:\chemin\vers\CODEX_AGENTS
+```
+
+### 3) Créer et activer un environnement Python
+
+PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Invite de commandes (CMD):
+
+```bat
+py -3.12 -m venv .venv
+.\.venv\Scripts\activate.bat
+```
+
+Si PowerShell bloque l'activation:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+### 4) Installer les dépendances
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r backend/requirements.txt
+npm install
+```
+
+### 5) Démarrer l'application
+
+```powershell
+npm run dev
+```
+
+L'application sera disponible sur:
+
+- Frontend: `http://localhost:5173`
+- API backend: `http://localhost:3000`
+
+### 6) Vérifier que tout fonctionne
+
+```powershell
+npm run lint
+npm run lint:backend
+npm run build
+```
+
+## Données et persistance
+
+- Le stockage est effectué dans `DB.json` à la racine du projet.
+- Ce fichier contient:
+  - la configuration LLM
+  - les connexions DB
+  - les agents créés
+- Sauvegarde simple: copier `DB.json`.
+
+## Scripts utiles
+
+- `npm run dev`: lance backend Python + frontend Vite
+- `npm run dev:backend`: lance uniquement FastAPI
+- `npm run dev:frontend`: lance uniquement Vite
+- `npm run lint`: vérification TypeScript
+- `npm run lint:backend`: compilation Python (sanity check)
+- `npm run build`: build frontend
