@@ -223,6 +223,17 @@ def _agent_catalog_entry(agent: Dict[str, Any]) -> Dict[str, Any]:
         ]
         entry["default_query"] = config.get("default_query")
         entry["supports_params"] = True
+    elif str(agent.get("agent_type") or "").strip().lower() == "clickhouse_generic":
+        config = build_agent_execution_config(agent)
+        entry["known_partition_keys"] = _coerce_string_list(
+            config.get("known_partition_keys") or config.get("partition_keys")
+        )
+        entry["known_order_keys"] = _coerce_string_list(
+            config.get("known_order_keys") or config.get("order_keys")
+        )
+        entry["materialized_views"] = _coerce_string_list(config.get("materialized_views"))
+        entry["dictionaries"] = _coerce_string_list(config.get("dictionaries"))
+        entry["supports_error_driven_rewrite"] = True
 
     return entry
 
@@ -3043,6 +3054,346 @@ def _replace_clickhouse_specific_placeholder(sql: str, token: str, replacement: 
     return output, replaced
 
 
+def _coerce_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        output: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                output.append(text)
+        return output
+    if isinstance(value, str):
+        chunks = re.split(r"[,;\n]+", value)
+        return [chunk.strip() for chunk in chunks if chunk.strip()]
+    return []
+
+
+def _is_clickhouse_select_query(sql: str) -> bool:
+    normalized = str(sql or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith("select ") or normalized.startswith("with ")
+
+
+def _has_clickhouse_limit_clause(sql: str) -> bool:
+    normalized = str(sql or "").lower()
+    return bool(re.search(r"\blimit\s+\d+", normalized))
+
+
+def _append_clickhouse_limit(sql: str, limit_value: int) -> str:
+    text = str(sql or "").strip()
+    if not text:
+        return text
+    if _has_clickhouse_limit_clause(text):
+        return text
+    suffix = ";"
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    else:
+        suffix = ""
+    return f"{text}\nLIMIT {limit_value}{suffix}"
+
+
+def _extract_where_clause(sql: str) -> str:
+    normalized = str(sql or "")
+    match = re.search(
+        r"\bwhere\b([\s\S]*?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|\bsettings\b|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return str(match.group(1) or "")
+
+
+def _has_filter_on_columns(sql: str, column_candidates: List[str]) -> bool:
+    where_clause = _extract_where_clause(sql).lower()
+    if not where_clause:
+        return False
+    for candidate in column_candidates:
+        token = str(candidate or "").strip().lower()
+        if not token:
+            continue
+        if re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", where_clause):
+            return True
+    return False
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _detect_simple_numeric_anomalies(rows: Any, threshold_pct: float) -> List[str]:
+    if not isinstance(rows, list) or len(rows) < 2:
+        return []
+
+    dict_rows = [row for row in rows if isinstance(row, dict)]
+    if len(dict_rows) < 2:
+        return []
+
+    last = dict_rows[-1]
+    prev = dict_rows[-2]
+    anomalies: List[str] = []
+    for key, last_value in last.items():
+        prev_value = _to_float_or_none(prev.get(key))
+        current_value = _to_float_or_none(last_value)
+        if prev_value is None or current_value is None:
+            continue
+        if prev_value == 0:
+            continue
+        delta_pct = ((current_value - prev_value) / abs(prev_value)) * 100.0
+        if abs(delta_pct) >= threshold_pct:
+            direction = "up" if delta_pct > 0 else "down"
+            anomalies.append(
+                f"{key}: {direction} {abs(delta_pct):.1f}% vs previous point "
+                f"({prev_value:.3f} -> {current_value:.3f})"
+            )
+    return anomalies
+
+
+def _extract_clickhouse_error_context(user_input: str, invocation: Dict[str, Any] | None) -> str:
+    candidates: List[str] = []
+    if isinstance(invocation, dict):
+        for key in ("error", "last_error", "db_error", "query_error", "previous_error"):
+            value = invocation.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+
+    parsed_input = _extract_possible_json(user_input)
+    if isinstance(parsed_input, dict):
+        for key in ("error", "last_error", "db_error", "query_error", "previous_error"):
+            value = parsed_input.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+
+    if len(candidates) == 0:
+        match = re.search(
+            r"(memory limit exceeded|syntax error|unknown table|unknown column|timeout|too many rows)",
+            user_input or "",
+            flags=re.IGNORECASE,
+        )
+        if match:
+            candidates.append(str(match.group(1)))
+
+    if len(candidates) == 0:
+        return ""
+    return _clip_text(candidates[0], max_chars=800)
+
+
+async def _finalize_clickhouse_generic_output(
+    *,
+    llm: Any,
+    content: str,
+    config: Dict[str, Any],
+    user_input: str,
+    invocation: Dict[str, Any] | None,
+    on_step: StepCallback | None,
+    agent_label: str,
+) -> AgentResult:
+    parsed_payload = _extract_possible_json(content)
+    base_payload: Dict[str, Any]
+    if isinstance(parsed_payload, dict):
+        base_payload = dict(parsed_payload)
+    else:
+        base_payload = {"answer": str(content or "").strip()}
+
+    sql = str(base_payload.get("sql") or "").strip()
+    guardrail_warnings: List[str] = []
+    optimization_notes = _coerce_string_list(base_payload.get("optimization_notes"))
+    recommendations = _coerce_string_list(base_payload.get("recommendations"))
+    anomaly_notes = _coerce_string_list(base_payload.get("anomaly_watch"))
+
+    enforce_limit = _coerce_bool(config.get("enforce_limit_on_exploration"), default=True)
+    default_limit = _coerce_int(config.get("default_exploration_limit"), default=200, minimum=10, maximum=20000)
+    enforce_explain = _coerce_bool(config.get("enforce_explain"), default=True)
+    threshold_pct = float(config.get("anomaly_threshold_pct") or 35)
+    partition_keys = _coerce_string_list(config.get("known_partition_keys") or config.get("partition_keys"))
+    dictionaries = _coerce_string_list(config.get("dictionaries"))
+    materialized_views = _coerce_string_list(config.get("materialized_views"))
+    order_keys = _coerce_string_list(config.get("known_order_keys") or config.get("order_keys"))
+    error_context = _extract_clickhouse_error_context(user_input, invocation)
+
+    if sql:
+        if _is_clickhouse_select_query(sql) and enforce_limit and not _has_clickhouse_limit_clause(sql):
+            sql = _append_clickhouse_limit(sql, default_limit)
+            guardrail_warnings.append(
+                f"No LIMIT found. Added LIMIT {default_limit} for exploration safety."
+            )
+
+        if partition_keys and _is_clickhouse_select_query(sql) and not _has_filter_on_columns(sql, partition_keys):
+            guardrail_warnings.append(
+                "Partition key/date filter not detected in WHERE. Risk of full scan on MergeTree tables."
+            )
+
+        if "count(distinct" in sql.lower() and "uniq(" not in sql.lower() and "uniqexact(" not in sql.lower():
+            recommendations.append(
+                "For huge cardinality, prefer uniq()/uniqExact() over COUNT(DISTINCT)."
+            )
+
+        advanced_tokens = (
+            "sumif(",
+            "countif(",
+            "uniq(",
+            "uniqexact(",
+            "quantile",
+            "arraymap(",
+            "arrayfilter(",
+            "arrayjoin(",
+            "jsonextract",
+            "asof join",
+            "dictget(",
+        )
+        if not any(token in sql.lower() for token in advanced_tokens):
+            optimization_notes.append(
+                "Consider ClickHouse-native functions (sumIf/countIf/uniq/array*/JSONExtract*/ASOF JOIN) when relevant."
+            )
+
+        if dictionaries and "dictget(" not in sql.lower():
+            recommendations.append(
+                "If dimensions are stored in dictionaries, consider dictGet() to avoid heavy joins."
+            )
+
+        if materialized_views:
+            recommendations.append(
+                "If an AggregatingMergeTree materialized view exists, prefer querying it with -Merge functions."
+            )
+
+        if order_keys and not _has_filter_on_columns(sql, order_keys):
+            optimization_notes.append(
+                "No ORDER BY key filter detected. Add selective predicates for better data skipping."
+            )
+
+    if error_context:
+        normalized_error = error_context.lower()
+        if "memory" in normalized_error and "limit" in normalized_error:
+            recommendations.append(
+                "Previous error indicates memory pressure. Reduce join fanout, add date filters, and prefer approximate aggregates."
+            )
+            if sql and _is_clickhouse_select_query(sql) and not _has_clickhouse_limit_clause(sql):
+                sql = _append_clickhouse_limit(sql, default_limit)
+        if "syntax" in normalized_error:
+            recommendations.append(
+                "Previous syntax error detected. Validate ClickHouse-specific functions and clause order."
+            )
+
+    if isinstance(base_payload.get("rows"), list):
+        anomaly_notes.extend(_detect_simple_numeric_anomalies(base_payload.get("rows"), threshold_pct))
+
+    # Dedicated audit pass: critique and refine generated query/payload.
+    if sql or base_payload.get("query_plan") or base_payload.get("task_dag"):
+        _emit_step(
+            on_step,
+            {
+                "status": "clickhouse_query_audit_started",
+                "agent": agent_label,
+                "message": "Auditing ClickHouse SQL and guardrails.",
+            },
+        )
+        audit_prompt = f"""You are a ClickHouse SQL performance and correctness auditor.
+Review and improve the payload below without inventing schema.
+
+User request:
+{_clip_text(user_input, 2000)}
+
+Payload to audit:
+{json.dumps(base_payload, ensure_ascii=False, indent=2)}
+
+Known partition keys:
+{json.dumps(partition_keys, ensure_ascii=False)}
+Known order keys:
+{json.dumps(order_keys, ensure_ascii=False)}
+Known materialized views:
+{json.dumps(materialized_views, ensure_ascii=False)}
+Known dictionaries:
+{json.dumps(dictionaries, ensure_ascii=False)}
+Previous error context:
+{error_context or "none"}
+
+Return ONLY JSON with this shape:
+{{
+  "sql": "optimized SQL",
+  "preflight_sql": "EXPLAIN ...",
+  "answer": "business-ready narrative",
+  "optimization_notes": ["..."],
+  "guardrail_warnings": ["..."],
+  "recommendations": ["..."],
+  "anomaly_watch": ["..."],
+  "missing_context": ["..."]
+}}"""
+        try:
+            audit_response = await llm.ainvoke([HumanMessage(content=audit_prompt)])
+            audit_content = _coerce_message_content(audit_response.content)
+            audited = _extract_possible_json(audit_content)
+            if isinstance(audited, dict):
+                for key in ("answer", "preflight_sql", "sql", "task_dag", "query_plan", "missing_context"):
+                    if key in audited and audited.get(key) not in (None, ""):
+                        base_payload[key] = audited.get(key)
+                optimization_notes.extend(_coerce_string_list(audited.get("optimization_notes")))
+                guardrail_warnings.extend(_coerce_string_list(audited.get("guardrail_warnings")))
+                recommendations.extend(_coerce_string_list(audited.get("recommendations")))
+                anomaly_notes.extend(_coerce_string_list(audited.get("anomaly_watch")))
+                sql = str(base_payload.get("sql") or sql).strip()
+        except Exception as exc:
+            guardrail_warnings.append(f"Audit step failed: {exc}")
+        _emit_step(
+            on_step,
+            {
+                "status": "clickhouse_query_audit_completed",
+                "agent": agent_label,
+                "message": "ClickHouse SQL audit completed.",
+            },
+        )
+
+    if sql and _is_clickhouse_select_query(sql) and enforce_limit and not _has_clickhouse_limit_clause(sql):
+        sql = _append_clickhouse_limit(sql, default_limit)
+        guardrail_warnings.append(
+            f"Post-audit guardrail applied: LIMIT {default_limit} appended."
+        )
+
+    base_payload["sql"] = sql
+    if enforce_explain and sql and not str(base_payload.get("preflight_sql") or "").strip():
+        base_payload["preflight_sql"] = f"EXPLAIN {sql}"
+
+    dedup = lambda items: list(dict.fromkeys([item for item in items if str(item or "").strip()]))
+    optimization_notes = dedup(optimization_notes)
+    guardrail_warnings = dedup(guardrail_warnings)
+    recommendations = dedup(recommendations)
+    anomaly_notes = dedup(anomaly_notes)
+
+    base_payload["optimization_notes"] = optimization_notes
+    base_payload["guardrail_warnings"] = guardrail_warnings
+    base_payload["recommendations"] = recommendations
+    base_payload["anomaly_watch"] = anomaly_notes
+    base_payload["guardrail_report"] = {
+        "limit_enforced": _has_clickhouse_limit_clause(sql) if sql else False,
+        "explain_enforced": bool(base_payload.get("preflight_sql")),
+        "partition_filter_present": _has_filter_on_columns(sql, partition_keys) if sql and partition_keys else None,
+        "error_context": error_context or None,
+    }
+
+    answer = str(
+        base_payload.get("answer")
+        or base_payload.get("business_summary")
+        or base_payload.get("analysis")
+        or ""
+    ).strip()
+    if not answer:
+        answer = "ClickHouse analysis prepared with SQL, guardrails, and optimization guidance."
+
+    if anomaly_notes:
+        answer = answer.rstrip() + "\n\nAnomaly watch:\n- " + "\n- ".join(anomaly_notes[:5])
+
+    return {
+        "answer": answer,
+        "sql": sql or None,
+        "rows": base_payload.get("rows") if isinstance(base_payload.get("rows"), list) else [],
+        "details": base_payload,
+    }
+
+
 class AgentExecutor:
     @staticmethod
     async def execute(
@@ -3112,6 +3463,97 @@ CRITICAL SECURITY RULE:
 - Ensure all inserted data is properly escaped and formatted.
 
 Return your response in JSON format: {{ "sql": "INSERT INTO agent_... ", "answer": "Data inserted." }}"""
+        elif agent_type == "clickhouse_generic":
+            partition_keys = _coerce_string_list(config.get("known_partition_keys") or config.get("partition_keys"))
+            order_keys = _coerce_string_list(config.get("known_order_keys") or config.get("order_keys"))
+            materialized_views = _coerce_string_list(config.get("materialized_views"))
+            dictionaries = _coerce_string_list(config.get("dictionaries"))
+            schema_context = str(
+                config.get("schema_context")
+                or config.get("ddl_context")
+                or config.get("data_dictionary")
+                or ""
+            ).strip()
+            business_rules = str(
+                config.get("business_rules")
+                or config.get("business_dictionary_context")
+                or config.get("rag_business_context")
+                or ""
+            ).strip()
+            error_context = _extract_clickhouse_error_context(user_input, invocation if isinstance(invocation, dict) else None)
+            default_limit = _coerce_int(
+                config.get("default_exploration_limit"),
+                default=200,
+                minimum=10,
+                maximum=20000,
+            )
+
+            system_prompt = f"""You are a Senior Generic ClickHouse Analytics Agent.
+Database: {config.get('database_name') or 'Unknown'}
+Timezone: {config.get('timezone') or 'UTC'}
+Default exploration LIMIT: {default_limit}
+
+CLICKHOUSE DIALECT MANDATORY RULES:
+- Use ClickHouse-native syntax and functions only.
+- Prefer uniq()/uniqExact() over COUNT(DISTINCT) for large volumes.
+- Use aggregate combinators when appropriate: -If, -Array, -State, -Merge.
+- Use arrayMap/arrayFilter/arrayJoin for arrays, JSONExtract* for JSON payloads.
+- Consider ASOF JOIN for time-series alignment; avoid expensive unbounded joins.
+- Keep smallest table on right side of JOIN when relevant.
+
+ENGINE-AWARE RULES:
+- Include partition/date filters and ORDER BY key filters whenever possible.
+- Prefer materialized views (AggregatingMergeTree) when they match the question.
+- Use dictGet() when dictionary-based dimensions are available.
+
+ANALYTICAL REASONING RULES:
+- Decompose complex business questions with CTEs (WITH ...).
+- If business formulas are unknown, state missing context instead of guessing.
+- Provide SQL plus business-level explanation and recommendations.
+
+GUARDRAILS:
+- Always provide preflight_sql (EXPLAIN query).
+- Add safe exploration limits when scanning unknown/large data.
+- If there is an error context, diagnose cause and provide an optimized rewrite.
+- Anticipate memory issues and reduce cardinality/join fanout when needed.
+
+RESULT INTERPRETATION:
+- Highlight significant anomalies proactively when visible in results.
+- Convert technical output into clear business narrative.
+
+Known partition keys:
+{json.dumps(partition_keys, ensure_ascii=False)}
+Known order keys:
+{json.dumps(order_keys, ensure_ascii=False)}
+Known materialized views:
+{json.dumps(materialized_views, ensure_ascii=False)}
+Known dictionaries:
+{json.dumps(dictionaries, ensure_ascii=False)}
+
+Return ONLY JSON with this exact shape:
+{{
+  "task_dag": [{{"id":"T1","task":"...","depends_on":[]}}],
+  "query_plan": ["step 1", "step 2"],
+  "sql": "SELECT ...",
+  "sql_alternatives": ["SELECT ..."],
+  "preflight_sql": "EXPLAIN SELECT ...",
+  "optimization_notes": ["..."],
+  "guardrail_warnings": ["..."],
+  "recommendations": ["..."],
+  "anomaly_watch": ["..."],
+  "missing_context": ["..."],
+  "answer": "clear business summary"
+}}"""
+
+            extra_parts: List[str] = []
+            if schema_context:
+                extra_parts.append(f"Schema/Data Dictionary Context:\n{schema_context}")
+            if business_rules:
+                extra_parts.append(f"Business Rules Context:\n{business_rules}")
+            if error_context:
+                extra_parts.append(f"Previous ClickHouse Error Context:\n{error_context}")
+            if extra_parts:
+                extra_context = "\n\n" + "\n\n".join(extra_parts)
         elif agent_type == "clickhouse_specific":
             templates = _normalize_clickhouse_specific_templates(config)
             default_query = str(config.get("default_query") or "").strip()
@@ -4138,6 +4580,25 @@ Instructions: {config.get('system_prompt') or ''}"""
                         },
                     )
                     return word_llm_result
+            if agent_type == "clickhouse_generic":
+                finalized_result = await _finalize_clickhouse_generic_output(
+                    llm=llm,
+                    content=content,
+                    config=config,
+                    user_input=user_input,
+                    invocation=invocation if isinstance(invocation, dict) else None,
+                    on_step=on_step,
+                    agent_label=agent_label,
+                )
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "ClickHouse generic analysis prepared.",
+                    },
+                )
+                return finalized_result
 
             if content.strip().startswith("{") or agent_type != "custom":
                 try:
