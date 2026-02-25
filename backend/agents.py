@@ -4,8 +4,10 @@ import asyncio
 import json
 import os
 import re
+from pathlib import Path
 from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, List, TypedDict
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -23,6 +25,7 @@ class AgentResult(TypedDict, total=False):
 
 
 StepCallback = Callable[[Dict[str, Any]], None]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _emit_step(on_step: StepCallback | None, step: Dict[str, Any]) -> None:
@@ -195,6 +198,1111 @@ def _resolve_agent_from_call(call: Dict[str, Any], candidates: List[Dict[str, An
         return candidates[0]
 
     return None
+
+
+def _extract_urls_from_text(text: str) -> List[str]:
+    matches = re.findall(r"https?://[^\s<>\"]+", text or "")
+    urls: List[str] = []
+    seen: set[str] = set()
+    for raw in matches:
+        cleaned = raw.rstrip(").,;!?]")
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        urls.append(cleaned)
+    return urls
+
+
+def _extract_requested_item_limit(text: str, default_limit: int = 10, hard_max: int = 50) -> int:
+    lowered = (text or "").lower()
+    patterns = [
+        r"(?:latest|top|first)\s+(\d{1,3})",
+        r"(\d{1,3})\s+(?:articles|results|links|titles|items)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+            return max(1, min(value, hard_max))
+        except Exception:
+            continue
+    return max(1, min(default_limit, hard_max))
+
+
+def _is_probable_article_anchor(title: str, url: str) -> bool:
+    title_norm = " ".join(title.split()).strip()
+    if len(title_norm) < 8:
+        return False
+
+    lower_title = title_norm.lower()
+    if lower_title in {"menu", "accueil", "home", "login", "connexion"}:
+        return False
+
+    lower_url = url.lower()
+    blocked_tokens = [
+        "/login",
+        "/connexion",
+        "/account",
+        "/compte",
+        "/abonnement",
+        "/subscribe",
+        "/newsletter",
+        "/video",
+        "/podcast",
+        "/tag/",
+        "#",
+        "javascript:",
+        "mailto:",
+    ]
+    if any(token in lower_url for token in blocked_tokens):
+        return False
+
+    return True
+
+
+def _extract_article_links_from_html(
+    page_url: str,
+    html: str,
+    max_links: int,
+    same_domain_only: bool,
+) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    base_domain = urlparse(page_url).netloc.lower()
+
+    selectors = [
+        "article a[href]",
+        "main a[href]",
+        "h1 a[href]",
+        "h2 a[href]",
+        "h3 a[href]",
+        "[data-testid] a[href]",
+        "a[href]",
+    ]
+
+    links: List[Dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for selector in selectors:
+        for anchor in soup.select(selector):
+            href = str(anchor.get("href") or "").strip()
+            if not href:
+                continue
+            if href.startswith("#") or href.lower().startswith("javascript:") or href.lower().startswith("mailto:"):
+                continue
+
+            absolute_url = urljoin(page_url, href)
+            parsed = urlparse(absolute_url)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+
+            if same_domain_only and base_domain:
+                target_domain = parsed.netloc.lower()
+                if target_domain and target_domain != base_domain and not target_domain.endswith(f".{base_domain}"):
+                    continue
+
+            title = anchor.get_text(" ", strip=True)
+            if not title:
+                continue
+            title = " ".join(title.split())
+            if not _is_probable_article_anchor(title, absolute_url):
+                continue
+
+            normalized_url = absolute_url.rstrip("/")
+            if normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            links.append({"title": title, "url": absolute_url})
+
+            if len(links) >= max_links:
+                return links
+
+    return links
+
+
+def _extract_possible_json(text: str) -> Any:
+    candidate = _extract_json_block(text or "").strip()
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+def _is_virtual_data_path(raw_path: str) -> bool:
+    normalized = str(raw_path or "").replace("\\", "/").strip()
+    return normalized == "/data" or normalized.startswith("/data/")
+
+
+def _resolve_workspace_storage_path(raw_path: str, fallback_dir: str | None = None) -> str:
+    value = os.path.expandvars(os.path.expanduser(str(raw_path or "").strip()))
+    if not value:
+        base = fallback_dir or str(PROJECT_ROOT)
+        return os.path.abspath(base)
+
+    if _is_virtual_data_path(value):
+        return os.path.abspath(os.path.join(str(PROJECT_ROOT), value.lstrip("/")))
+
+    if os.path.isabs(value):
+        return os.path.abspath(value)
+
+    base = fallback_dir or str(PROJECT_ROOT)
+    return os.path.abspath(os.path.join(base, value))
+
+
+def _resolve_excel_workbook_path(config: Dict[str, Any], workbook_path: str | None = None) -> str:
+    configured_folder = str(config.get("folder_path") or "").strip()
+    configured_workbook = str(config.get("workbook_path") or "").strip()
+    requested_workbook = str(workbook_path or "").strip()
+
+    default_folder = str(PROJECT_ROOT / "data" / "spreadsheets")
+    resolved_folder = _resolve_workspace_storage_path(configured_folder, fallback_dir=default_folder)
+    raw_path = requested_workbook or configured_workbook or "data.xlsx"
+    resolved = _resolve_workspace_storage_path(raw_path, fallback_dir=resolved_folder)
+
+    if bool(config.get("auto_create_folder", True)):
+        parent = os.path.dirname(resolved) or resolved_folder
+        os.makedirs(parent, exist_ok=True)
+
+    return resolved
+
+
+def _guess_sheet_name_from_text(text: str, default_name: str) -> str:
+    patterns = [
+        r"(?:sheet|onglet|feuille)\s+[\"']([^\"']+)[\"']",
+        r"(?:sheet|onglet|feuille)\s+([A-Za-z0-9 _-]{1,50})",
+    ]
+    lowered = text or ""
+    for pattern in patterns:
+        match = re.search(pattern, lowered, flags=re.IGNORECASE)
+        if match:
+            value = " ".join(str(match.group(1)).split()).strip()
+            if value:
+                return value
+    return default_name
+
+
+def _guess_sheet_rename_from_text(text: str) -> tuple[str, str] | None:
+    patterns = [
+        r"(?:rename|renomme(?:r)?|renommer)\s+(?:the\s+|la\s+|le\s+|l')?(?:sheet|onglet|feuille)\s+[\"']([^\"']+)[\"']\s+(?:to|en|vers)\s+[\"']([^\"']+)[\"']",
+        r"(?:rename|renomme(?:r)?|renommer)\s+(?:the\s+|la\s+|le\s+|l')?(?:sheet|onglet|feuille)\s+([A-Za-z0-9 _-]{1,50}?)\s+(?:to|en|vers)\s+([A-Za-z0-9 _-]{1,50})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if not match:
+            continue
+        source = " ".join(str(match.group(1)).split()).strip()
+        target = " ".join(str(match.group(2)).split()).strip()
+        if source and target:
+            return source, target
+    return None
+
+
+def _guess_workbook_path_from_text(text: str) -> str | None:
+    quoted = re.search(
+        r"[\"']([^\"']+\.(?:xlsx|xlsm|xltx|xltm))[\"']",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if quoted:
+        return str(quoted.group(1)).strip()
+
+    bare = re.search(
+        r"([A-Za-z]:[\\/][^\s\"']+\.(?:xlsx|xlsm|xltx|xltm)|\.{0,2}[\\/][^\s\"']+\.(?:xlsx|xlsm|xltx|xltm)|[A-Za-z0-9._/-]+\.(?:xlsx|xlsm|xltx|xltm))",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if bare:
+        return str(bare.group(1)).strip()
+    return None
+
+
+def _guess_cell_and_value_from_text(text: str) -> tuple[str, Any] | None:
+    patterns = [
+        r"(?:cellule|cell)\s+([A-Za-z]{1,3}\d{1,6})\s*(?:=|:|to|avec|with)\s*[\"']([^\"']*)[\"']",
+        r"([A-Za-z]{1,3}\d{1,6})\s*(?:=|:)\s*[\"']([^\"']*)[\"']",
+        r"(?:cellule|cell)\s+([A-Za-z]{1,3}\d{1,6})\s*(?:=|:|to|avec|with)\s*([^\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if not match:
+            continue
+        cell = str(match.group(1)).upper().strip()
+        value = str(match.group(2)).strip()
+        if cell:
+            return (cell, value)
+    return None
+
+
+def _normalize_excel_action_payload(action: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = dict(action)
+    raw_action_name = str(normalized.get("action") or "").strip().lower()
+    action_aliases = {
+        "create_file": "create_workbook",
+        "new_workbook": "create_workbook",
+        "remove_workbook": "delete_workbook",
+        "delete_file": "delete_workbook",
+        "remove_sheet": "delete_sheet",
+        "new_sheet": "create_sheet",
+        "add_sheet": "create_sheet",
+        "write_cell": "write_cells",
+        "set_cell": "write_cells",
+        "append_row": "append_rows",
+        "read_rows": "read_sheet",
+    }
+    normalized["action"] = action_aliases.get(raw_action_name, raw_action_name)
+
+    if normalized.get("workbook_path") in (None, ""):
+        for key in ("file_path", "file", "path", "workbook", "workbook_file"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized["workbook_path"] = value.strip()
+                break
+
+    if normalized.get("sheet") in (None, ""):
+        for key in ("sheet_name", "worksheet", "tab", "onglet", "feuille"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized["sheet"] = value.strip()
+                break
+
+    if normalized.get("new_name") in (None, ""):
+        for key in ("target_sheet", "new_sheet", "target", "destination", "to"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized["new_name"] = value.strip()
+                break
+
+    if normalized.get("action") == "write_cells" and not isinstance(normalized.get("cells"), dict):
+        cell = normalized.get("cell")
+        if cell is not None:
+            normalized["cells"] = {str(cell): normalized.get("value")}
+
+    if normalized.get("action") == "append_rows" and not isinstance(normalized.get("rows"), list):
+        alt_rows = normalized.get("data") or normalized.get("values")
+        if isinstance(alt_rows, list):
+            normalized["rows"] = alt_rows
+
+    return normalized
+
+
+def _normalize_excel_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    allow_heuristics: bool = True,
+) -> List[Dict[str, Any]] | None:
+    parsed = _extract_possible_json(user_input)
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("actions"), list):
+            actions = [_normalize_excel_action_payload(action) for action in parsed["actions"] if isinstance(action, dict)]
+            return actions if actions else None
+        if isinstance(parsed.get("action"), str):
+            return [_normalize_excel_action_payload(parsed)]
+    if isinstance(parsed, list):
+        actions = [_normalize_excel_action_payload(action) for action in parsed if isinstance(action, dict)]
+        if actions:
+            return actions
+
+    if not allow_heuristics:
+        return None
+
+    text = (user_input or "").strip()
+    lowered = text.lower()
+    default_sheet = str(config.get("default_sheet") or "Sheet1")
+    workbook_hint = _guess_workbook_path_from_text(text)
+    heuristics: List[Dict[str, Any]] = []
+
+    def add_action(action: Dict[str, Any]) -> None:
+        if workbook_hint and not action.get("workbook_path"):
+            action["workbook_path"] = workbook_hint
+        heuristics.append(_normalize_excel_action_payload(action))
+
+    if re.search(r"(list|show|affiche|liste).*(sheet|sheets|onglet|onglets|feuille|feuilles)", lowered):
+        add_action({"action": "list_sheets"})
+    elif re.search(r"(create|new|cr[eé]e|créer|ajoute|add).*(workbook|excel|classeur|fichier)", lowered):
+        add_action({"action": "create_workbook"})
+    elif re.search(r"(delete|remove|supprime|supprimer).*(workbook|excel|classeur|fichier)", lowered):
+        add_action({"action": "delete_workbook"})
+    elif re.search(r"(rename|renomme|renommer).*(sheet|onglet|feuille)", lowered):
+        rename_pair = _guess_sheet_rename_from_text(text)
+        if rename_pair:
+            source, target = rename_pair
+        else:
+            source = _guess_sheet_name_from_text(text, default_sheet)
+            target_match = re.search(
+                r"(?:to|en|vers)\s+[\"']([^\"']+)[\"']|(?:to|en|vers)\s+([A-Za-z0-9 _-]{1,50})",
+                text,
+                flags=re.IGNORECASE,
+            )
+            target = source
+            if target_match:
+                target = (target_match.group(1) or target_match.group(2) or source).strip()
+        add_action({"action": "rename_sheet", "sheet": source, "new_name": target})
+    elif re.search(r"(create|new|add|cr[eé]e|créer|ajoute).*(sheet|onglet|feuille)", lowered):
+        add_action({"action": "create_sheet", "sheet": _guess_sheet_name_from_text(text, default_sheet)})
+    elif re.search(r"(delete|remove|supprime|supprimer).*(sheet|onglet|feuille)", lowered):
+        add_action({"action": "delete_sheet", "sheet": _guess_sheet_name_from_text(text, default_sheet)})
+    elif re.search(r"(read|lire|show|affiche).*(sheet|onglet|feuille)", lowered):
+        add_action(
+            {
+                "action": "read_sheet",
+                "sheet": _guess_sheet_name_from_text(text, default_sheet),
+                "max_rows": int(config.get("max_rows_read") or 100),
+            }
+        )
+    else:
+        cell_value = _guess_cell_and_value_from_text(text)
+        if cell_value:
+            cell, value = cell_value
+            add_action(
+                {
+                    "action": "write_cells",
+                    "sheet": _guess_sheet_name_from_text(text, default_sheet),
+                    "cells": {cell: value},
+                }
+            )
+
+    return heuristics if heuristics else None
+
+
+async def _execute_excel_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    on_step: StepCallback | None,
+    agent_label: str,
+    allow_heuristics: bool = True,
+) -> AgentResult | None:
+    actions = _normalize_excel_actions(user_input, config, allow_heuristics=allow_heuristics)
+    if not actions:
+        return None
+
+    try:
+        import openpyxl  # type: ignore
+    except Exception as exc:
+        return {
+            "answer": (
+                "Excel manager requires the `openpyxl` dependency. "
+                f"Install it to enable workbook operations. ({exc})"
+            )
+        }
+
+    default_sheet = str(config.get("default_sheet") or "Sheet1")
+    auto_create_workbook = bool(config.get("auto_create_workbook"))
+    allow_overwrite = bool(config.get("allow_overwrite"))
+    max_rows_read = int(config.get("max_rows_read") or 100)
+
+    operation_logs: List[Dict[str, Any]] = []
+    last_read_rows: List[List[Any]] = []
+    last_sheet_names: List[str] = []
+    workbook_path_cache: str | None = None
+
+    for action in actions:
+        action_name = str(action.get("action") or "").strip().lower()
+        try:
+            workbook_path = _resolve_excel_workbook_path(config, action.get("workbook_path"))
+        except Exception as exc:
+            return {
+                "answer": f"Unable to resolve workbook path: {exc}",
+                "details": {"action": action_name, "requested_workbook_path": action.get("workbook_path")},
+            }
+        workbook_path_cache = workbook_path
+        _emit_step(
+            on_step,
+            {
+                "status": "excel_action_started",
+                "agent": agent_label,
+                "action": action_name,
+                "workbook_path": workbook_path,
+            },
+        )
+
+        if action_name == "create_workbook":
+            if os.path.exists(workbook_path) and not allow_overwrite:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Workbook already exists and overwrite is disabled.",
+                        "workbook_path": workbook_path,
+                    }
+                )
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "excel_action_completed",
+                        "agent": agent_label,
+                        "action": action_name,
+                        "result": "skipped_existing",
+                    },
+                )
+                continue
+
+            workbook = openpyxl.Workbook()
+            active = workbook.active
+            active.title = str(action.get("sheet") or default_sheet)[:31] or "Sheet1"
+            workbook.save(workbook_path)
+            operation_logs.append({"action": action_name, "status": "ok", "workbook_path": workbook_path})
+            _emit_step(
+                on_step,
+                {
+                    "status": "excel_action_completed",
+                    "agent": agent_label,
+                    "action": action_name,
+                    "result": "created",
+                },
+            )
+            continue
+
+        if action_name == "delete_workbook":
+            if os.path.exists(workbook_path):
+                os.remove(workbook_path)
+                operation_logs.append({"action": action_name, "status": "ok", "workbook_path": workbook_path})
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "excel_action_completed",
+                        "agent": agent_label,
+                        "action": action_name,
+                        "result": "deleted",
+                    },
+                )
+            else:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Workbook does not exist.",
+                        "workbook_path": workbook_path,
+                    }
+                )
+            continue
+
+        if not os.path.exists(workbook_path):
+            if auto_create_workbook:
+                workbook = openpyxl.Workbook()
+                workbook.active.title = default_sheet[:31] or "Sheet1"
+                workbook.save(workbook_path)
+            else:
+                return {
+                    "answer": (
+                        f"Workbook not found at {workbook_path}. "
+                        "Enable auto_create_workbook or create it first."
+                    ),
+                    "details": {
+                        "action": action_name,
+                        "workbook_path": workbook_path,
+                    },
+                }
+
+        workbook = openpyxl.load_workbook(workbook_path)
+        changed = False
+
+        try:
+            if action_name == "list_sheets":
+                last_sheet_names = list(workbook.sheetnames)
+                operation_logs.append({"action": action_name, "status": "ok", "sheets": last_sheet_names})
+            elif action_name == "create_sheet":
+                sheet_name = str(action.get("sheet") or default_sheet).strip()[:31] or "Sheet1"
+                if sheet_name in workbook.sheetnames:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Sheet already exists.", "sheet": sheet_name}
+                    )
+                else:
+                    workbook.create_sheet(title=sheet_name)
+                    changed = True
+                    operation_logs.append({"action": action_name, "status": "ok", "sheet": sheet_name})
+            elif action_name == "delete_sheet":
+                sheet_name = str(action.get("sheet") or default_sheet).strip()
+                if sheet_name not in workbook.sheetnames:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Sheet not found.", "sheet": sheet_name}
+                    )
+                elif len(workbook.sheetnames) <= 1:
+                    operation_logs.append(
+                        {
+                            "action": action_name,
+                            "status": "skipped",
+                            "reason": "Cannot delete the last remaining sheet.",
+                            "sheet": sheet_name,
+                        }
+                    )
+                else:
+                    del workbook[sheet_name]
+                    changed = True
+                    operation_logs.append({"action": action_name, "status": "ok", "sheet": sheet_name})
+            elif action_name == "rename_sheet":
+                source = str(action.get("sheet") or default_sheet).strip()
+                target = str(action.get("new_name") or "").strip()[:31]
+                if source not in workbook.sheetnames:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Source sheet not found.", "sheet": source}
+                    )
+                elif not target:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Target sheet name is empty.", "sheet": source}
+                    )
+                elif target in workbook.sheetnames:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Target sheet already exists.", "sheet": target}
+                    )
+                else:
+                    workbook[source].title = target
+                    changed = True
+                    operation_logs.append({"action": action_name, "status": "ok", "sheet": source, "new_name": target})
+            elif action_name == "write_cells":
+                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                if sheet_name not in workbook.sheetnames:
+                    workbook.create_sheet(title=sheet_name[:31])
+                    changed = True
+                sheet = workbook[sheet_name[:31]]
+                cells = action.get("cells")
+                if not isinstance(cells, dict) or len(cells) == 0:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "No cells payload provided.", "sheet": sheet_name}
+                    )
+                else:
+                    written = 0
+                    for cell_ref, value in cells.items():
+                        ref = str(cell_ref).upper().strip()
+                        if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", ref):
+                            continue
+                        sheet[ref] = value
+                        written += 1
+                    changed = changed or (written > 0)
+                    operation_logs.append(
+                        {"action": action_name, "status": "ok", "sheet": sheet_name, "written_cells": written}
+                    )
+            elif action_name == "append_rows":
+                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                if sheet_name not in workbook.sheetnames:
+                    workbook.create_sheet(title=sheet_name[:31])
+                    changed = True
+                sheet = workbook[sheet_name[:31]]
+                rows_payload = action.get("rows")
+                if isinstance(rows_payload, list) and len(rows_payload) > 0:
+                    appended = 0
+                    for row in rows_payload:
+                        if isinstance(row, list):
+                            sheet.append(row)
+                            appended += 1
+                    changed = changed or (appended > 0)
+                    operation_logs.append(
+                        {"action": action_name, "status": "ok", "sheet": sheet_name, "appended_rows": appended}
+                    )
+                else:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "No rows payload provided.", "sheet": sheet_name}
+                    )
+            elif action_name == "read_sheet":
+                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                if sheet_name not in workbook.sheetnames:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Sheet not found.", "sheet": sheet_name}
+                    )
+                else:
+                    limit = int(action.get("max_rows") or max_rows_read)
+                    limit = max(1, min(limit, 5000))
+                    sheet = workbook[sheet_name]
+                    last_read_rows = []
+                    for row in sheet.iter_rows(min_row=1, max_row=limit, values_only=True):
+                        last_read_rows.append(list(row))
+                    operation_logs.append(
+                        {"action": action_name, "status": "ok", "sheet": sheet_name, "rows_read": len(last_read_rows)}
+                    )
+            else:
+                operation_logs.append({"action": action_name, "status": "skipped", "reason": "Unsupported action."})
+        finally:
+            if changed:
+                workbook.save(workbook_path)
+            workbook.close()
+
+        _emit_step(
+            on_step,
+            {
+                "status": "excel_action_completed",
+                "agent": agent_label,
+                "action": action_name,
+            },
+        )
+
+    summary_parts = [f"{len(operation_logs)} action(s) processed"]
+    if workbook_path_cache:
+        summary_parts.append(f"workbook={workbook_path_cache}")
+    if last_sheet_names:
+        summary_parts.append(f"sheets={', '.join(last_sheet_names)}")
+    if last_read_rows:
+        summary_parts.append(f"rows_read={len(last_read_rows)}")
+
+    return {
+        "answer": "Excel operations completed: " + " | ".join(summary_parts),
+        "details": {
+            "workbook_path": workbook_path_cache,
+            "operations": operation_logs,
+            "sheet_names": last_sheet_names,
+            "rows": last_read_rows[:200],
+        },
+    }
+
+
+def _resolve_word_document_path(config: Dict[str, Any], document_path: str | None = None) -> str:
+    configured_folder = str(config.get("folder_path") or "").strip()
+    configured_document = str(config.get("document_path") or "").strip()
+    requested_document = str(document_path or "").strip()
+
+    default_folder = str(PROJECT_ROOT / "data" / "documents")
+    resolved_folder = _resolve_workspace_storage_path(configured_folder, fallback_dir=default_folder)
+    raw_path = requested_document or configured_document or "report.docx"
+    resolved = _resolve_workspace_storage_path(raw_path, fallback_dir=resolved_folder)
+
+    if bool(config.get("auto_create_folder", True)):
+        parent = os.path.dirname(resolved) or resolved_folder
+        os.makedirs(parent, exist_ok=True)
+
+    return resolved
+
+
+def _guess_word_document_path_from_text(text: str) -> str | None:
+    quoted = re.search(
+        r"[\"']([^\"']+\.(?:docx|docm|dotx|dotm))[\"']",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if quoted:
+        return str(quoted.group(1)).strip()
+
+    bare = re.search(
+        r"([A-Za-z]:[\\/][^\s\"']+\.(?:docx|docm|dotx|dotm)|\.{0,2}[\\/][^\s\"']+\.(?:docx|docm|dotx|dotm)|[A-Za-z0-9._/-]+\.(?:docx|docm|dotx|dotm))",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if bare:
+        return str(bare.group(1)).strip()
+    return None
+
+
+def _coerce_word_paragraphs(value: Any) -> List[str]:
+    if isinstance(value, str):
+        lines = [line.strip() for line in value.splitlines()]
+        return [line for line in lines if line]
+    if isinstance(value, list):
+        paragraphs: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                paragraphs.append(text)
+        return paragraphs
+    return []
+
+
+def _guess_replace_text_from_text(text: str) -> tuple[str, str] | None:
+    patterns = [
+        r"(?:replace|remplace(?:r)?)\s+[\"']([^\"']+)[\"']\s+(?:with|par|to)\s+[\"']([^\"']*)[\"']",
+        r"(?:replace|remplace(?:r)?)(?:\s+the)?(?:\s+text)?\s+[\"']([^\"']+)[\"']\s+(?:with|par|to)\s+[\"']([^\"']*)[\"']",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if match:
+            old_text = str(match.group(1)).strip()
+            new_text = str(match.group(2))
+            if old_text:
+                return old_text, new_text
+    return None
+
+
+def _guess_word_payload_from_text(text: str) -> List[str]:
+    quoted = [str(item).strip() for item in re.findall(r"[\"']([^\"']+)[\"']", text or "")]
+    quoted = [item for item in quoted if item]
+    if quoted:
+        return quoted
+
+    colon_match = re.search(r"[:：]\s*(.+)$", text or "", flags=re.IGNORECASE)
+    if colon_match:
+        payload = str(colon_match.group(1)).strip()
+        if payload:
+            return [payload]
+    return []
+
+
+def _normalize_word_action_payload(action: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = dict(action)
+    raw_action_name = str(normalized.get("action") or "").strip().lower()
+    action_aliases = {
+        "create_file": "create_document",
+        "new_document": "create_document",
+        "new_doc": "create_document",
+        "delete_file": "delete_document",
+        "remove_document": "delete_document",
+        "remove_doc": "delete_document",
+        "read": "read_document",
+        "write": "write_paragraphs",
+        "overwrite": "write_paragraphs",
+        "append": "append_paragraphs",
+        "append_text": "append_paragraphs",
+        "replace": "replace_text",
+    }
+    normalized["action"] = action_aliases.get(raw_action_name, raw_action_name)
+
+    if normalized.get("document_path") in (None, ""):
+        for key in ("file_path", "file", "path", "document", "doc_path", "document_file"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized["document_path"] = value.strip()
+                break
+
+    action_name = str(normalized.get("action") or "")
+
+    if action_name in {"write_paragraphs", "append_paragraphs"}:
+        raw_paragraphs = normalized.get("paragraphs")
+        if raw_paragraphs in (None, ""):
+            for key in ("text", "content", "body", "lines", "paragraph"):
+                if normalized.get(key) not in (None, ""):
+                    raw_paragraphs = normalized.get(key)
+                    break
+        normalized["paragraphs"] = _coerce_word_paragraphs(raw_paragraphs)
+
+    if action_name == "replace_text":
+        old_text = normalized.get("old_text")
+        new_text = normalized.get("new_text")
+        if old_text in (None, ""):
+            for key in ("from", "find", "target", "search", "old"):
+                if normalized.get(key) not in (None, ""):
+                    old_text = normalized.get(key)
+                    break
+        if new_text in (None, ""):
+            for key in ("to", "replace", "replacement", "new"):
+                if normalized.get(key) is not None:
+                    new_text = normalized.get(key)
+                    break
+        normalized["old_text"] = str(old_text or "")
+        normalized["new_text"] = str(new_text or "")
+
+    if action_name == "read_document" and normalized.get("max_paragraphs") in (None, ""):
+        for key in ("limit", "max_rows", "max_lines"):
+            value = normalized.get(key)
+            if value not in (None, ""):
+                normalized["max_paragraphs"] = value
+                break
+
+    return normalized
+
+
+def _normalize_word_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    allow_heuristics: bool = True,
+) -> List[Dict[str, Any]] | None:
+    parsed = _extract_possible_json(user_input)
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("actions"), list):
+            actions = [_normalize_word_action_payload(action) for action in parsed["actions"] if isinstance(action, dict)]
+            return actions if actions else None
+        if isinstance(parsed.get("action"), str):
+            return [_normalize_word_action_payload(parsed)]
+    if isinstance(parsed, list):
+        actions = [_normalize_word_action_payload(action) for action in parsed if isinstance(action, dict)]
+        if actions:
+            return actions
+
+    if not allow_heuristics:
+        return None
+
+    text = (user_input or "").strip()
+    lowered = text.lower()
+    document_hint = _guess_word_document_path_from_text(text)
+    max_paragraphs_read = int(config.get("max_paragraphs_read") or 100)
+    heuristics: List[Dict[str, Any]] = []
+
+    def add_action(action: Dict[str, Any]) -> None:
+        if document_hint and not action.get("document_path"):
+            action["document_path"] = document_hint
+        heuristics.append(_normalize_word_action_payload(action))
+
+    if re.search(r"(create|new|cr[eé]e|créer|add|ajoute).*(document|word|docx|fichier)", lowered):
+        add_action({"action": "create_document"})
+    elif re.search(r"(delete|remove|supprime|supprimer).*(document|word|docx|fichier)", lowered):
+        add_action({"action": "delete_document"})
+    elif re.search(r"(read|lire|show|affiche).*(document|word|docx|fichier)", lowered):
+        add_action({"action": "read_document", "max_paragraphs": max_paragraphs_read})
+    else:
+        replace_payload = _guess_replace_text_from_text(text)
+        if replace_payload:
+            old_text, new_text = replace_payload
+            add_action({"action": "replace_text", "old_text": old_text, "new_text": new_text})
+        elif re.search(r"(append|add|ajoute).*(paragraph|paragraphe|texte)", lowered):
+            paragraphs = _guess_word_payload_from_text(text)
+            if paragraphs:
+                add_action({"action": "append_paragraphs", "paragraphs": paragraphs})
+        elif re.search(r"(write|ecris|écris|r[eé]dige|overwrite|replace all|remplace le contenu|modifie|modifier|edit)", lowered):
+            paragraphs = _guess_word_payload_from_text(text)
+            if paragraphs:
+                add_action({"action": "write_paragraphs", "paragraphs": paragraphs})
+
+    return heuristics if heuristics else None
+
+
+def _clear_word_document_paragraphs(document: Any) -> None:
+    for paragraph in list(document.paragraphs):
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
+
+async def _execute_word_actions(
+    user_input: str,
+    config: Dict[str, Any],
+    on_step: StepCallback | None,
+    agent_label: str,
+    allow_heuristics: bool = True,
+) -> AgentResult | None:
+    actions = _normalize_word_actions(user_input, config, allow_heuristics=allow_heuristics)
+    if not actions:
+        return None
+
+    try:
+        from docx import Document  # type: ignore
+    except Exception as exc:
+        return {
+            "answer": (
+                "Word manager requires the `python-docx` dependency. "
+                f"Install it to enable document operations. ({exc})"
+            )
+        }
+
+    max_paragraphs_read = int(config.get("max_paragraphs_read") or 100)
+    auto_create_document = bool(config.get("auto_create_document"))
+    allow_overwrite = bool(config.get("allow_overwrite"))
+
+    operation_logs: List[Dict[str, Any]] = []
+    last_read_paragraphs: List[str] = []
+    document_path_cache: str | None = None
+
+    for action in actions:
+        action_name = str(action.get("action") or "").strip().lower()
+        try:
+            document_path = _resolve_word_document_path(config, action.get("document_path"))
+        except Exception as exc:
+            return {
+                "answer": f"Unable to resolve document path: {exc}",
+                "details": {"action": action_name, "requested_document_path": action.get("document_path")},
+            }
+        document_path_cache = document_path
+
+        _emit_step(
+            on_step,
+            {
+                "status": "word_action_started",
+                "agent": agent_label,
+                "action": action_name,
+                "document_path": document_path,
+            },
+        )
+
+        if action_name == "create_document":
+            if os.path.exists(document_path) and not allow_overwrite:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Document already exists and overwrite is disabled.",
+                        "document_path": document_path,
+                    }
+                )
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "word_action_completed",
+                        "agent": agent_label,
+                        "action": action_name,
+                        "result": "skipped_existing",
+                    },
+                )
+                continue
+
+            document = Document()
+            paragraphs = _coerce_word_paragraphs(action.get("paragraphs"))
+            for paragraph in paragraphs:
+                document.add_paragraph(paragraph)
+            document.save(document_path)
+            operation_logs.append(
+                {
+                    "action": action_name,
+                    "status": "ok",
+                    "document_path": document_path,
+                    "paragraphs_written": len(paragraphs),
+                }
+            )
+            _emit_step(
+                on_step,
+                {
+                    "status": "word_action_completed",
+                    "agent": agent_label,
+                    "action": action_name,
+                    "result": "created",
+                },
+            )
+            continue
+
+        if action_name == "delete_document":
+            if os.path.exists(document_path):
+                os.remove(document_path)
+                operation_logs.append({"action": action_name, "status": "ok", "document_path": document_path})
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "word_action_completed",
+                        "agent": agent_label,
+                        "action": action_name,
+                        "result": "deleted",
+                    },
+                )
+            else:
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "skipped",
+                        "reason": "Document does not exist.",
+                        "document_path": document_path,
+                    }
+                )
+            continue
+
+        if not os.path.exists(document_path):
+            if auto_create_document:
+                document = Document()
+                document.save(document_path)
+            else:
+                return {
+                    "answer": (
+                        f"Document not found at {document_path}. "
+                        "Enable auto_create_document or create it first."
+                    ),
+                    "details": {
+                        "action": action_name,
+                        "document_path": document_path,
+                    },
+                }
+
+        try:
+            document = Document(document_path)
+        except Exception as exc:
+            return {
+                "answer": f"Unable to open document at {document_path}: {exc}",
+                "details": {"action": action_name, "document_path": document_path},
+            }
+        changed = False
+
+        if action_name == "read_document":
+            limit = int(action.get("max_paragraphs") or max_paragraphs_read)
+            limit = max(1, min(limit, 5000))
+            last_read_paragraphs = []
+            for paragraph in document.paragraphs:
+                text = str(paragraph.text or "").strip()
+                if not text:
+                    continue
+                last_read_paragraphs.append(text)
+                if len(last_read_paragraphs) >= limit:
+                    break
+            operation_logs.append(
+                {
+                    "action": action_name,
+                    "status": "ok",
+                    "paragraphs_read": len(last_read_paragraphs),
+                }
+            )
+        elif action_name == "write_paragraphs":
+            paragraphs = _coerce_word_paragraphs(action.get("paragraphs"))
+            if len(paragraphs) == 0:
+                operation_logs.append(
+                    {"action": action_name, "status": "skipped", "reason": "No paragraph payload provided."}
+                )
+            else:
+                _clear_word_document_paragraphs(document)
+                for paragraph in paragraphs:
+                    document.add_paragraph(paragraph)
+                changed = True
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "ok",
+                        "paragraphs_written": len(paragraphs),
+                    }
+                )
+        elif action_name == "append_paragraphs":
+            paragraphs = _coerce_word_paragraphs(action.get("paragraphs"))
+            if len(paragraphs) == 0:
+                operation_logs.append(
+                    {"action": action_name, "status": "skipped", "reason": "No paragraph payload provided."}
+                )
+            else:
+                for paragraph in paragraphs:
+                    document.add_paragraph(paragraph)
+                changed = True
+                operation_logs.append(
+                    {
+                        "action": action_name,
+                        "status": "ok",
+                        "paragraphs_appended": len(paragraphs),
+                    }
+                )
+        elif action_name == "replace_text":
+            old_text = str(action.get("old_text") or "")
+            new_text = str(action.get("new_text") or "")
+            if not old_text:
+                operation_logs.append(
+                    {"action": action_name, "status": "skipped", "reason": "No source text provided."}
+                )
+            else:
+                replaced_count = 0
+                for paragraph in document.paragraphs:
+                    content = str(paragraph.text or "")
+                    if old_text in content:
+                        paragraph.text = content.replace(old_text, new_text)
+                        replaced_count += 1
+                if replaced_count > 0:
+                    changed = True
+                    operation_logs.append(
+                        {
+                            "action": action_name,
+                            "status": "ok",
+                            "paragraphs_replaced": replaced_count,
+                        }
+                    )
+                else:
+                    operation_logs.append(
+                        {"action": action_name, "status": "skipped", "reason": "Text not found in document."}
+                    )
+        else:
+            operation_logs.append({"action": action_name, "status": "skipped", "reason": "Unsupported action."})
+
+        if changed:
+            document.save(document_path)
+
+        _emit_step(
+            on_step,
+            {
+                "status": "word_action_completed",
+                "agent": agent_label,
+                "action": action_name,
+            },
+        )
+
+    summary_parts = [f"{len(operation_logs)} action(s) processed"]
+    if document_path_cache:
+        summary_parts.append(f"document={document_path_cache}")
+    if last_read_paragraphs:
+        summary_parts.append(f"paragraphs_read={len(last_read_paragraphs)}")
+
+    return {
+        "answer": "Word operations completed: " + " | ".join(summary_parts),
+        "details": {
+            "document_path": document_path_cache,
+            "operations": operation_logs,
+            "paragraphs": last_read_paragraphs[:500],
+        },
+    }
 
 
 def build_agent_execution_config(agent: Dict[str, Any]) -> Dict[str, Any]:
@@ -480,16 +1588,46 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 "\"details\": {\"action\": \"read|write|append\", \"file\": \"filename\"} }"
             )
         elif agent_type == "excel_manager":
+            excel_result = await _execute_excel_actions(user_input, config, on_step, agent_label)
+            if excel_result is not None:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "Excel operations executed.",
+                    },
+                )
+                return excel_result
+
             system_prompt = (
                 f"You are an Excel Manager. Workbook: {config.get('workbook_path')}.\n"
-                "Return your response in JSON format: { \"answer\": \"Excel operations completed.\", "
-                "\"details\": {\"action\": \"read|write\", \"sheet\": \"sheetname\"} }"
+                "If the user asks to create/modify/delete workbook/sheets/cells, return JSON actions using this schema:\n"
+                "{ \"actions\": [ {\"action\": \"create_workbook|delete_workbook|list_sheets|create_sheet|delete_sheet|rename_sheet|write_cells|append_rows|read_sheet\", "
+                "\"workbook_path\": \"optional\", \"sheet\": \"optional\", \"new_name\": \"optional\", \"cells\": {\"A1\": \"value\"}, "
+                "\"rows\": [[\"v1\", \"v2\"]], \"max_rows\": 100 } ] }\n"
+                "Otherwise return your response in JSON format: { \"answer\": \"Excel operations completed.\" }"
             )
         elif agent_type == "word_manager":
+            word_result = await _execute_word_actions(user_input, config, on_step, agent_label)
+            if word_result is not None:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "Word operations executed.",
+                    },
+                )
+                return word_result
+
             system_prompt = (
                 f"You are a Word Manager. Document: {config.get('document_path')}.\n"
-                "Return your response in JSON format: { \"answer\": \"Word operations completed.\", "
-                "\"details\": {\"action\": \"read|write\"} }"
+                "If the user asks to create/modify/delete/read document content, return JSON actions using this schema:\n"
+                "{ \"actions\": [ {\"action\": \"create_document|delete_document|read_document|write_paragraphs|append_paragraphs|replace_text\", "
+                "\"document_path\": \"optional\", \"paragraphs\": [\"line 1\", \"line 2\"], "
+                "\"old_text\": \"optional\", \"new_text\": \"optional\", \"max_paragraphs\": 100 } ] }\n"
+                "Otherwise return your response in JSON format: { \"answer\": \"Word operations completed.\" }"
             )
         elif agent_type == "elasticsearch_retriever":
             system_prompt = (
@@ -591,12 +1729,147 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 except Exception:
                     pass
         elif agent_type == "web_navigator":
-            system_prompt = (
-                f"You are a Web Navigator. Start URL: {config.get('start_url')}. "
-                f"Max steps: {config.get('max_steps') or 5}.\n"
-                "Return your response in JSON format: { \"answer\": \"Navigation completed.\" }"
+            navigation_urls = _extract_urls_from_text(user_input)
+            if not navigation_urls:
+                start_url = str(config.get("start_url") or "").strip()
+                if start_url:
+                    navigation_urls = [start_url]
+
+            max_nav_steps = max(1, min(int(config.get("max_steps") or 5), 10))
+            default_item_limit = int(config.get("max_links") or config.get("max_items") or 10)
+            item_limit = _extract_requested_item_limit(user_input, default_limit=default_item_limit, hard_max=50)
+            timeout_seconds = int(config.get("timeout_seconds") or 20)
+            same_domain_only = config.get("same_domain_only")
+            if same_domain_only is None:
+                same_domain_only = True
+            same_domain_only = bool(same_domain_only)
+
+            if len(navigation_urls) == 0:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": "No URL provided to web navigator.",
+                    },
+                )
+                return {"answer": "No URL provided. Please include a target URL or configure `start_url`."}
+
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+            }
+
+            collected_links: List[Dict[str, str]] = []
+            failures: List[str] = []
+            requested_urls = navigation_urls[:max_nav_steps]
+
+            for target_url in requested_urls:
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "navigator_fetch_started",
+                        "agent": agent_label,
+                        "url": target_url,
+                    },
+                )
+                try:
+                    response = await asyncio.to_thread(
+                        requests.get,
+                        target_url,
+                        headers=headers,
+                        timeout=timeout_seconds,
+                        allow_redirects=True,
+                    )
+                    if not response.ok:
+                        failures.append(f"{target_url} -> HTTP {response.status_code}")
+                        _emit_step(
+                            on_step,
+                            {
+                                "status": "navigator_fetch_failed",
+                                "agent": agent_label,
+                                "url": target_url,
+                                "error": f"HTTP {response.status_code}",
+                            },
+                        )
+                        continue
+
+                    resolved_url = response.url or target_url
+                    remaining = max(item_limit - len(collected_links), 0)
+                    if remaining <= 0:
+                        break
+
+                    links = _extract_article_links_from_html(
+                        resolved_url,
+                        response.text,
+                        max_links=remaining,
+                        same_domain_only=same_domain_only,
+                    )
+                    collected_links.extend(links)
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "navigator_fetch_completed",
+                            "agent": agent_label,
+                            "url": resolved_url,
+                            "links_found": len(links),
+                        },
+                    )
+
+                    if len(collected_links) >= item_limit:
+                        break
+                except Exception as exc:
+                    failures.append(f"{target_url} -> {exc}")
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "navigator_fetch_failed",
+                            "agent": agent_label,
+                            "url": target_url,
+                            "error": str(exc),
+                        },
+                    )
+
+            if len(collected_links) > 0:
+                payload = collected_links[:item_limit]
+                answer = json.dumps(payload, ensure_ascii=False, indent=2)
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "agent_completed",
+                        "agent": agent_label,
+                        "message": f"Navigation completed with {len(payload)} links.",
+                    },
+                )
+                return {
+                    "answer": answer,
+                    "details": {
+                        "links": payload,
+                        "requested_urls": requested_urls,
+                        "failures": failures,
+                    },
+                }
+
+            fallback_message = (
+                "Web navigation failed to extract article links from the target page(s). "
+                "The site may block automated requests or require JavaScript rendering."
             )
-            extra_context = "\n\nNote: Playwright is not installed in this environment. The agent is marked as unavailable."
+            if failures:
+                fallback_message += f" Details: {' | '.join(failures[:3])}"
+
+            _emit_step(
+                on_step,
+                {
+                    "status": "agent_completed",
+                    "agent": agent_label,
+                    "message": "Navigation finished with no extractable links.",
+                },
+            )
+            return {"answer": fallback_message, "details": {"requested_urls": requested_urls, "failures": failures}}
         else:
             system_prompt = f"""Role: {config.get('role') or 'Assistant'}
 Persona: {config.get('persona') or 'Helpful'}
@@ -628,6 +1901,43 @@ Instructions: {config.get('system_prompt') or ''}"""
                     "message": "Model response received. Preparing final answer.",
                 },
             )
+
+            if agent_type == "excel_manager":
+                excel_llm_result = await _execute_excel_actions(
+                    content,
+                    config,
+                    on_step,
+                    agent_label,
+                    allow_heuristics=False,
+                )
+                if excel_llm_result is not None:
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "agent_completed",
+                            "agent": agent_label,
+                            "message": "Excel operations executed.",
+                        },
+                    )
+                    return excel_llm_result
+            if agent_type == "word_manager":
+                word_llm_result = await _execute_word_actions(
+                    content,
+                    config,
+                    on_step,
+                    agent_label,
+                    allow_heuristics=False,
+                )
+                if word_llm_result is not None:
+                    _emit_step(
+                        on_step,
+                        {
+                            "status": "agent_completed",
+                            "agent": agent_label,
+                            "message": "Word operations executed.",
+                        },
+                    )
+                    return word_llm_result
 
             if content.strip().startswith("{") or agent_type != "custom":
                 try:

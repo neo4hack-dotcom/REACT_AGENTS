@@ -82,13 +82,13 @@ const AGENT_TEMPLATES: Record<string, any> = {
     persona: "Careful, systematic, and secure."
   },
   excel_manager: {
-    config: { folder_path: "/data/spreadsheets", workbook_path: "data.xlsx", default_sheet: "Sheet1", auto_create_folder: true, auto_create_workbook: false, max_rows_read: 1000 },
+    config: { folder_path: "data/spreadsheets", workbook_path: "data.xlsx", default_sheet: "Sheet1", auto_create_folder: true, auto_create_workbook: false, max_rows_read: 1000 },
     role: "Excel Spreadsheet Manager",
     objectives: "Read and manipulate Excel workbooks safely, ensuring valid cell references and data integrity.",
     persona: "Methodical, accurate, and data-focused."
   },
   word_manager: {
-    config: { folder_path: "/data/documents", document_path: "report.docx", auto_create_folder: true, auto_create_document: false, allow_overwrite: false, max_paragraphs_read: 100 },
+    config: { folder_path: "data/documents", document_path: "report.docx", auto_create_folder: true, auto_create_document: false, allow_overwrite: false, max_paragraphs_read: 100 },
     role: "Word Document Editor",
     objectives: "Read, edit, and generate Word documents, replacing placeholders with concrete content.",
     persona: "Articulate, professional, and formatting-aware."
