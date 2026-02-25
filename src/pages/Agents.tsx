@@ -179,6 +179,28 @@ export default function Agents() {
     }
   }, [token]);
 
+  const readErrorMessage = async (res: Response) => {
+    const contentType = res.headers.get('content-type') || '';
+
+    if (contentType.includes('application/json')) {
+      try {
+        const data = await res.json();
+        if (data?.error) return data.error as string;
+      } catch (_err) {
+        // Fall back to text parsing below.
+      }
+    }
+
+    try {
+      const text = await res.text();
+      if (text) return text;
+    } catch (_err) {
+      // No-op
+    }
+
+    return `${res.status} ${res.statusText}`.trim();
+  };
+
   const handleAgentTypeChange = (type: string) => {
     const template = AGENT_TEMPLATES[type] || AGENT_TEMPLATES['custom'];
     setNewAgent({
@@ -193,21 +215,44 @@ export default function Agents() {
   };
 
   const fetchAgents = async () => {
-    const res = await fetch('/api/agents', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    setAgents(await res.json());
+    if (!token) return;
+    try {
+      const res = await fetch('/api/agents', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+      setAgents(await res.json());
+    } catch (e: any) {
+      console.error('Failed to fetch agents:', e);
+      setAgents([]);
+    }
   };
 
   const fetchDbConfigs = async () => {
-    const res = await fetch('/api/config/db', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    setDbConfigs(await res.json());
+    if (!token) return;
+    try {
+      const res = await fetch('/api/config/db', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+      setDbConfigs(await res.json());
+    } catch (e: any) {
+      console.error('Failed to fetch db configs:', e);
+      setDbConfigs([]);
+    }
   };
 
   const createAgent = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!token) {
+      alert("Session expired. Please sign in again.");
+      return;
+    }
+
     let parsedConfig = {};
     try {
       parsedConfig = JSON.parse(newAgent.configStr);
@@ -228,8 +273,8 @@ export default function Agents() {
       });
       
       if (!res.ok) {
-        const data = await res.json();
-        alert(`Failed to create agent: ${data.error}`);
+        const message = await readErrorMessage(res);
+        alert(`Failed to create agent: ${message}`);
         return;
       }
       
@@ -242,6 +287,11 @@ export default function Agents() {
   };
 
   const deleteAgent = async (id: number) => {
+    if (!token) {
+      alert("Session expired. Please sign in again.");
+      return;
+    }
+
     await fetch(`/api/agents/${id}`, { 
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` }

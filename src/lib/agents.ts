@@ -172,15 +172,15 @@ Return your response in JSON format: { "answer": "Synthesized content..." }`;
             });
             const result = await client.search({
               index: config.index,
-              body: {
-                query: {
-                  simple_query_string: {
-                    query: input,
-                    fields: config.fields ? config.fields.split(',') : ['*']
-                  }
-                },
-                size: config.top_k || 5
-              }
+              query: {
+                simple_query_string: {
+                  query: input,
+                  fields: config.fields
+                    ? config.fields.split(',').map((field: string) => field.trim())
+                    : ['*']
+                }
+              },
+              size: config.top_k || 5
             });
             const hits = result.hits.hits.map((h: any) => h._source);
             extraContext = `\n\nElasticsearch Results:\n${JSON.stringify(hits).substring(0, 5000)}`;
