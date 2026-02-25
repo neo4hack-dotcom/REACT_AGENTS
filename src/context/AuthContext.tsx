@@ -16,15 +16,6 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  // --- AUTH DISABLED TEMPORARILY ---
-  const [user, setUser] = useState<User | null>({ id: 1, username: 'admin' });
-  const [token, setToken] = useState<string | null>('mock-token');
-  const [loading, setLoading] = useState(false);
-
-  const login = (newToken: string) => {};
-  const logout = () => {};
-
-  /* ORIGINAL CODE
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
   const [loading, setLoading] = useState(true);
@@ -62,7 +53,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setToken(null);
     setUser(null);
   };
-  */
 
   return (
     <AuthContext.Provider value={{ user, token, login, logout, loading }}>
