@@ -16,6 +16,7 @@ AI Data Agents permet de:
 - configurer des connexions de données
 - discuter avec un agent unique ou un orchestrateur multi-agents
 - suivre les étapes d'exécution en streaming (SSE)
+- utiliser un manager renforcé (révision de plan à chaque itération, anti-doublons d'appels)
 
 ## Architecture
 
@@ -35,6 +36,7 @@ Les agents disponibles dans l'interface (type + description):
 | `sql_analyst` | SQL Analyst | Traduit des demandes en SQL ClickHouse optimisé et explique les résultats. |
 | `clickhouse_table_manager` | ClickHouse Table Manager | Administre les tables ClickHouse avec garde-fous de sécurité. |
 | `clickhouse_writer` | ClickHouse Writer | Crée des tables temporaires et écrit des données en imposant le préfixe `agent_`. |
+| `clickhouse_specific` | ClickHouse Specific | Exécute des requêtes templates paramétrées (ex: `P1`, `P2`) remplies par le manager. |
 | `unstructured_to_structured` | Unstructured to Structured | Extrait du JSON structuré depuis du texte non structuré selon un schéma. |
 | `email_cleaner` | Email Cleaner | Résume des emails bruyants en sections actionnables et concises. |
 | `file_assistant` | File Assistant | Répond à partir de fichiers locaux fournis (mode RAG léger sur fichiers). |
@@ -153,3 +155,16 @@ npm run build
 - `npm run lint`: vérification TypeScript
 - `npm run lint:backend`: compilation Python (sanity check)
 - `npm run build`: build frontend
+
+## Sécurité des dépendances npm
+
+Le projet n'utilise plus l'ancien backend Node.js, donc les dépendances npm héritées (LangChain JS, Express, SQLite JS, etc.) ont été retirées pour réduire la surface d'attaque et éviter les vulnérabilités transitive inutiles.
+
+Vérification recommandée:
+
+```powershell
+npm install
+npm audit
+```
+
+Résultat actuel après nettoyage: `0 vulnerabilities` (audit npm local).
