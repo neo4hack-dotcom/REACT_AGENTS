@@ -151,7 +151,7 @@ const AGENT_TEMPLATES: Record<string, any> = {
     persona: "Informed, objective, and concise."
   },
   web_scraper: {
-    config: { start_urls: "https://example.com", include_urls_from_question: true, search_fallback: true, follow_links: false, same_domain_only: true, allowed_domains: "example.com", max_pages: 3, max_links_per_page: 10, max_chars_per_page: 10000, timeout_seconds: 15, region: "us-en", safe_search: true, allow_reader_proxy: true },
+    config: { start_urls: "www.google.fr", include_urls_from_question: true, search_fallback: true, follow_links: true, same_domain_only: true, allowed_domains: "", max_pages: 10, max_links_per_page: 50, max_chars_per_page: 20000, timeout_seconds: 30, region: "us-en", safe_search: true, allow_reader_proxy: true },
     role: "Web Scraping Specialist",
     objectives: "Extract and synthesize text from web pages, using search fallbacks when necessary.",
     persona: "Resourceful, fast, and analytical."
