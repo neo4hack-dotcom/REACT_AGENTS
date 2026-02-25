@@ -373,6 +373,11 @@ def _normalize_navigation_url_candidates(urls: List[str]) -> tuple[List[str], Li
         if not candidate:
             continue
 
+        if "://" not in candidate:
+            bare_candidate = candidate.lstrip(".,;:")
+            if re.match(r"^(?:www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:[/?#].*)?$", bare_candidate):
+                candidate = f"https://{bare_candidate}"
+
         parsed = urlparse(candidate)
         if parsed.scheme in {"http", "https"} and parsed.netloc:
             normalized = candidate.rstrip("/")
@@ -393,6 +398,12 @@ def _normalize_navigation_url_candidates(urls: List[str]) -> tuple[List[str], Li
 
 def _extract_raw_navigation_tokens(text: str) -> List[str]:
     matches = re.findall(r"https?://[^\s<>\"]*", text or "")
+    matches.extend(
+        re.findall(
+            r"\b(?:www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:/[^\s<>\"]*)?\b",
+            text or "",
+        )
+    )
     tokens: List[str] = []
     seen: set[str] = set()
     for match in matches:
@@ -555,6 +566,252 @@ def _extract_article_links_from_html(
 
             if len(links) >= max_links:
                 return links
+
+    return links
+
+
+def _discover_feed_links_from_html(page_url: str, html: str, max_links: int = 8) -> List[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    discovered: List[str] = []
+    seen: set[str] = set()
+
+    selectors = [
+        "link[rel='alternate'][type*='rss']",
+        "link[rel='alternate'][type*='atom']",
+        "link[rel='alternate'][type*='xml']",
+        "a[href*='rss']",
+        "a[href*='feed']",
+    ]
+
+    for selector in selectors:
+        for node in soup.select(selector):
+            href = str(node.get("href") or "").strip()
+            if not href:
+                continue
+            candidate = urljoin(page_url, href).strip()
+            parsed = urlparse(candidate)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            normalized = candidate.rstrip("/")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            discovered.append(candidate)
+            if len(discovered) >= max_links:
+                return discovered
+
+    return discovered
+
+
+def _build_common_feed_candidates(url: str, max_links: int = 8) -> List[str]:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    candidates = [
+        f"{root}/rss",
+        f"{root}/rss.xml",
+        f"{root}/feed",
+        f"{root}/feed.xml",
+        f"{root}/atom.xml",
+        f"{root}/feeds/all.atom.xml",
+        f"{root}/actualites/rss.xml",
+        f"{root}/news/rss.xml",
+    ]
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+        if len(deduped) >= max_links:
+            break
+    return deduped
+
+
+def _build_http_headers(
+    *,
+    language_hint: str = "en-US,en;q=0.9,fr;q=0.8",
+    prefer_xml: bool = False,
+    referer: str | None = None,
+    user_agent: str | None = None,
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {
+        "User-Agent": user_agent
+        or (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": language_hint,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    if prefer_xml:
+        headers["Accept"] = (
+            "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5"
+        )
+    else:
+        headers["Accept"] = (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        )
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def _resolve_accept_language(language_hint: Any) -> str:
+    raw = str(language_hint or "").strip().lower()
+    if not raw:
+        return "en-US,en;q=0.9,fr;q=0.8"
+    if "," in raw or ";" in raw:
+        return str(language_hint)
+    if raw in {"fr", "fr-fr"}:
+        return "fr-FR,fr;q=0.95,en;q=0.7"
+    if raw in {"en", "en-us", "en-gb"}:
+        return "en-US,en;q=0.95,fr;q=0.6"
+    return f"{raw};q=1.0,en;q=0.7"
+
+
+def _fetch_url_with_fallback(
+    url: str,
+    *,
+    timeout_seconds: int = 20,
+    prefer_xml: bool = False,
+    language_hint: str = "en-US,en;q=0.9,fr;q=0.8",
+    allow_common_feed_candidates: bool = False,
+) -> tuple[requests.Response | None, List[str]]:
+    raw_url = str(url or "").strip()
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None, [f"{raw_url} -> invalid_url"]
+
+    root_referer = f"{parsed.scheme}://{parsed.netloc}/"
+    candidates: List[str] = [raw_url]
+    if allow_common_feed_candidates:
+        candidates.extend(_build_common_feed_candidates(raw_url, max_links=8))
+
+    tried: set[str] = set()
+    failures: List[str] = []
+    user_agents = [
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) "
+            "Gecko/20100101 Firefox/123.0"
+        ),
+    ]
+
+    for candidate in candidates:
+        normalized_candidate = str(candidate or "").strip()
+        if not normalized_candidate:
+            continue
+        if normalized_candidate in tried:
+            continue
+        tried.add(normalized_candidate)
+
+        for ua in user_agents:
+            headers = _build_http_headers(
+                language_hint=_resolve_accept_language(language_hint),
+                prefer_xml=prefer_xml,
+                referer=root_referer,
+                user_agent=ua,
+            )
+            try:
+                response = requests.get(
+                    normalized_candidate,
+                    headers=headers,
+                    timeout=timeout_seconds,
+                    allow_redirects=True,
+                )
+                if response.ok and response.content:
+                    return response, failures
+                failures.append(f"{normalized_candidate} -> HTTP {response.status_code}")
+            except Exception as exc:
+                failures.append(f"{normalized_candidate} -> {exc}")
+
+    return None, failures
+
+
+def _extract_feed_entries_from_content(content: bytes | str | None) -> List[Dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        parsed = feedparser.parse(content)
+        entries = parsed.entries or []
+        normalized: List[Dict[str, Any]] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                normalized.append(entry)
+            else:
+                try:
+                    normalized.append(dict(entry))
+                except Exception:
+                    continue
+        return normalized
+    except Exception:
+        return []
+
+
+def _entry_to_link_item(entry: Dict[str, Any], base_url: str) -> Dict[str, str] | None:
+    title = " ".join(str(entry.get("title") or "").split()).strip()
+    link = str(entry.get("link") or entry.get("id") or "").strip()
+    if not title or not link:
+        return None
+    resolved = urljoin(base_url, link)
+    parsed = urlparse(resolved)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return {"title": title, "url": resolved}
+
+
+def _extract_fallback_links_from_html(
+    page_url: str,
+    html: str,
+    max_links: int,
+    same_domain_only: bool,
+) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    base_domain = urlparse(page_url).netloc.lower()
+    links: List[Dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for anchor in soup.select("a[href]"):
+        href = str(anchor.get("href") or "").strip()
+        if not href:
+            continue
+        if href.startswith("#") or href.lower().startswith("javascript:") or href.lower().startswith("mailto:"):
+            continue
+
+        absolute_url = urljoin(page_url, href)
+        parsed = urlparse(absolute_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+
+        if same_domain_only and base_domain:
+            target_domain = parsed.netloc.lower()
+            if target_domain and target_domain != base_domain and not target_domain.endswith(f".{base_domain}"):
+                continue
+
+        title = anchor.get_text(" ", strip=True)
+        if not title:
+            title = str(anchor.get("title") or parsed.path or parsed.netloc or "").strip()
+        title = " ".join(title.split())
+        if len(title) < 3:
+            continue
+
+        normalized_url = absolute_url.rstrip("/")
+        if normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        links.append({"title": title, "url": absolute_url})
+        if len(links) >= max_links:
+            break
 
     return links
 
@@ -797,6 +1054,12 @@ def _normalize_excel_action_payload(action: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(alt_rows, list):
             normalized["rows"] = alt_rows
 
+    if normalized.get("auto_create_workbook") in (None, ""):
+        for key in ("auto_create", "create_if_missing", "create_workbook_if_missing"):
+            if key in normalized:
+                normalized["auto_create_workbook"] = normalized.get(key)
+                break
+
     return normalized
 
 
@@ -904,6 +1167,13 @@ async def _execute_excel_actions(
     auto_create_workbook = bool(config.get("auto_create_workbook"))
     allow_overwrite = bool(config.get("allow_overwrite"))
     max_rows_read = int(config.get("max_rows_read") or 100)
+    lowered_request = (user_input or "").lower()
+    request_forces_auto_create = bool(
+        re.search(r"auto[_\s-]*create[_\s-]*workbook", lowered_request)
+        or re.search(r"(create|new|cr[eé]e|créer).*(workbook|excel|classeur|fichier)", lowered_request)
+        or "if absent" in lowered_request
+        or "if missing" in lowered_request
+    )
 
     operation_logs: List[Dict[str, Any]] = []
     last_read_rows: List[List[Any]] = []
@@ -912,6 +1182,10 @@ async def _execute_excel_actions(
 
     for action in actions:
         action_name = str(action.get("action") or "").strip().lower()
+        action_auto_create_workbook = _coerce_bool(
+            action.get("auto_create_workbook"),
+            default=(auto_create_workbook or request_forces_auto_create),
+        )
         try:
             workbook_path = _resolve_excel_workbook_path(config, action.get("workbook_path"))
         except Exception as exc:
@@ -992,10 +1266,26 @@ async def _execute_excel_actions(
             continue
 
         if not os.path.exists(workbook_path):
-            if auto_create_workbook:
+            if action_auto_create_workbook:
                 workbook = openpyxl.Workbook()
                 workbook.active.title = default_sheet[:31] or "Sheet1"
                 workbook.save(workbook_path)
+                operation_logs.append(
+                    {
+                        "action": "auto_create_workbook",
+                        "status": "ok",
+                        "workbook_path": workbook_path,
+                    }
+                )
+                _emit_step(
+                    on_step,
+                    {
+                        "status": "excel_action_completed",
+                        "agent": agent_label,
+                        "action": "auto_create_workbook",
+                        "result": "created_missing_workbook",
+                    },
+                )
             else:
                 return {
                     "answer": (
@@ -1005,6 +1295,7 @@ async def _execute_excel_actions(
                     "details": {
                         "action": action_name,
                         "workbook_path": workbook_path,
+                        "auto_create_workbook": action_auto_create_workbook,
                     },
                 }
 
@@ -2699,52 +2990,258 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 f"You are an RSS News summarizer. Feeds: {config.get('feed_urls')}. "
                 f"Interests: {config.get('interests')}."
             )
-            feed_urls = config.get("feed_urls")
-            if feed_urls:
+            configured_urls = [url.strip() for url in str(config.get("feed_urls") or "").split(",") if url.strip()]
+            include_urls_from_question = bool(config.get("include_urls_from_question", True))
+            question_urls = _extract_urls_from_text(user_input) if include_urls_from_question else []
+            seed_urls: List[str] = []
+            seen_seed: set[str] = set()
+            for candidate in [*configured_urls, *question_urls]:
+                normalized = candidate.rstrip("/")
+                if normalized in seen_seed:
+                    continue
+                seen_seed.add(normalized)
+                seed_urls.append(candidate)
+
+            if seed_urls:
                 try:
-                    urls = [url.strip() for url in str(feed_urls).split(",") if url.strip()]
-                    max_items = int(config.get("max_items_per_feed") or 5)
-                    feed_items: List[Any] = []
-                    for url in urls:
-                        try:
-                            response = await asyncio.to_thread(requests.get, url, timeout=20)
-                            parsed = feedparser.parse(response.content)
-                            feed_items.extend(parsed.entries[:max_items])
-                        except Exception:
+                    max_items_per_feed = max(1, min(int(config.get("max_items_per_feed") or 5), 30))
+                    top_k = max(1, min(int(config.get("top_k") or 10), 100))
+                    timeout_seconds = max(5, min(int(config.get("timeout_seconds") or 20), 45))
+                    language_hint = _resolve_accept_language(config.get("language_hint"))
+                    interests = [
+                        token.strip().lower()
+                        for token in str(config.get("interests") or "").split(",")
+                        if token.strip()
+                    ]
+                    exclude_keywords = [
+                        token.strip().lower()
+                        for token in str(config.get("exclude_keywords") or "").split(",")
+                        if token.strip()
+                    ]
+                    include_general_if_no_match = bool(config.get("include_general_if_no_match", True))
+
+                    harvested_items: List[Dict[str, str]] = []
+                    failures: List[str] = []
+
+                    for seed_url in seed_urls:
+                        direct_response, direct_failures = await asyncio.to_thread(
+                            _fetch_url_with_fallback,
+                            seed_url,
+                            timeout_seconds=timeout_seconds,
+                            prefer_xml=True,
+                            language_hint=language_hint,
+                            allow_common_feed_candidates=True,
+                        )
+                        failures.extend(direct_failures[:2])
+
+                        direct_entries: List[Dict[str, Any]] = []
+                        direct_base_url = seed_url
+                        discovered_feeds: List[str] = []
+                        if direct_response is not None:
+                            direct_base_url = direct_response.url or seed_url
+                            direct_entries = _extract_feed_entries_from_content(direct_response.content)
+                            if len(direct_entries) == 0:
+                                discovered_feeds.extend(
+                                    _discover_feed_links_from_html(
+                                        direct_base_url,
+                                        direct_response.text,
+                                        max_links=8,
+                                    )
+                                )
+                        if len(direct_entries) == 0 and len(discovered_feeds) == 0:
+                            html_response, html_failures = await asyncio.to_thread(
+                                _fetch_url_with_fallback,
+                                seed_url,
+                                timeout_seconds=timeout_seconds,
+                                prefer_xml=False,
+                                language_hint=language_hint,
+                                allow_common_feed_candidates=False,
+                            )
+                            failures.extend(html_failures[:1])
+                            if html_response is not None:
+                                discovered_feeds.extend(
+                                    _discover_feed_links_from_html(
+                                        html_response.url or seed_url,
+                                        html_response.text,
+                                        max_links=8,
+                                    )
+                                )
+
+                        if len(direct_entries) > 0:
+                            for entry in direct_entries[:max_items_per_feed]:
+                                mapped = _entry_to_link_item(entry, direct_base_url)
+                                if mapped is None:
+                                    continue
+                                summary = str(entry.get("summary") or entry.get("description") or "")
+                                summary_text = BeautifulSoup(summary, "html.parser").get_text(" ", strip=True)
+                                harvested_items.append(
+                                    {
+                                        "title": mapped["title"],
+                                        "url": mapped["url"],
+                                        "summary": summary_text,
+                                        "source": seed_url,
+                                    }
+                                )
                             continue
 
-                    lines: List[str] = []
-                    for item in feed_items:
-                        title = item.get("title", "")
-                        summary = item.get("summary") or item.get("description") or ""
-                        lines.append(f"- {title}: {summary}")
+                        if len(discovered_feeds) == 0:
+                            discovered_feeds = _build_common_feed_candidates(seed_url, max_links=8)
 
-                    extra_context = "\n\nRecent News Items:\n" + "\n".join(lines)
-                except Exception:
-                    pass
+                        seen_discovered: set[str] = set()
+                        for feed_url in discovered_feeds:
+                            normalized_feed = str(feed_url or "").rstrip("/")
+                            if not normalized_feed or normalized_feed in seen_discovered:
+                                continue
+                            seen_discovered.add(normalized_feed)
+                            feed_response, feed_failures = await asyncio.to_thread(
+                                _fetch_url_with_fallback,
+                                feed_url,
+                                timeout_seconds=timeout_seconds,
+                                prefer_xml=True,
+                                language_hint=language_hint,
+                                allow_common_feed_candidates=False,
+                            )
+                            failures.extend(feed_failures[:1])
+                            if feed_response is None:
+                                continue
+                            feed_entries = _extract_feed_entries_from_content(feed_response.content)
+                            if len(feed_entries) == 0:
+                                continue
+                            for entry in feed_entries[:max_items_per_feed]:
+                                mapped = _entry_to_link_item(entry, feed_response.url or feed_url)
+                                if mapped is None:
+                                    continue
+                                summary = str(entry.get("summary") or entry.get("description") or "")
+                                summary_text = BeautifulSoup(summary, "html.parser").get_text(" ", strip=True)
+                                harvested_items.append(
+                                    {
+                                        "title": mapped["title"],
+                                        "url": mapped["url"],
+                                        "summary": summary_text,
+                                        "source": feed_response.url or feed_url,
+                                    }
+                                )
+                            break
+
+                    deduped_items: List[Dict[str, str]] = []
+                    seen_item_keys: set[str] = set()
+                    for item in harvested_items:
+                        title = " ".join(str(item.get("title") or "").split()).strip()
+                        url = str(item.get("url") or "").strip()
+                        if not title or not url:
+                            continue
+                        dedupe_key = f"{title.lower()}|{url.rstrip('/').lower()}"
+                        if dedupe_key in seen_item_keys:
+                            continue
+                        seen_item_keys.add(dedupe_key)
+                        deduped_items.append(item)
+
+                    matched_items: List[Dict[str, str]] = []
+                    if len(interests) > 0:
+                        for item in deduped_items:
+                            searchable = (
+                                f"{item.get('title', '')} {item.get('summary', '')}".lower()
+                            )
+                            if any(token in searchable for token in interests):
+                                matched_items.append(item)
+                    else:
+                        matched_items = deduped_items
+
+                    selected_items = matched_items
+                    if len(selected_items) == 0 and include_general_if_no_match:
+                        selected_items = deduped_items
+
+                    filtered_items: List[Dict[str, str]] = []
+                    for item in selected_items:
+                        searchable = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+                        if any(token in searchable for token in exclude_keywords):
+                            continue
+                        filtered_items.append(item)
+
+                    payload_items = filtered_items[:top_k]
+                    if len(payload_items) > 0:
+                        lines: List[str] = []
+                        for item in payload_items:
+                            title = item.get("title") or ""
+                            summary = item.get("summary") or ""
+                            url = item.get("url") or ""
+                            source = item.get("source") or ""
+                            if summary:
+                                lines.append(f"- {title} ({url}) [{source}] :: {summary}")
+                            else:
+                                lines.append(f"- {title} ({url}) [{source}]")
+                        extra_context = "\n\nRecent News Items:\n" + "\n".join(lines)
+                    else:
+                        details = " | ".join(failures[:3]) if failures else "No parsable RSS entries found."
+                        return {
+                            "answer": (
+                                "RSS fetch failed for the configured sources. "
+                                "This environment may be blocked by site protections (403), invalid feed URLs (404), "
+                                f"or missing discoverable feed endpoints. Details: {details}"
+                            ),
+                            "details": {
+                                "seed_urls": seed_urls,
+                                "failures": failures[:10],
+                            },
+                        }
+                except Exception as exc:
+                    return {
+                        "answer": f"RSS agent failed while fetching feeds: {exc}",
+                        "details": {"seed_urls": seed_urls},
+                    }
         elif agent_type == "web_scraper":
             system_prompt = (
                 f"You are a Web Scraper. Start URLs: {config.get('start_urls')}. "
                 f"Allowed domains: {config.get('allowed_domains')}."
             )
-            start_urls = config.get("start_urls")
-            if start_urls:
+            start_urls = [url.strip() for url in str(config.get("start_urls") or "").split(",") if url.strip()]
+            include_urls_from_question = bool(config.get("include_urls_from_question", True))
+            question_urls = _extract_urls_from_text(user_input) if include_urls_from_question else []
+            combined_urls: List[str] = []
+            seen_combined: set[str] = set()
+            for candidate in [*start_urls, *question_urls]:
+                normalized = candidate.rstrip("/")
+                if normalized in seen_combined:
+                    continue
+                seen_combined.add(normalized)
+                combined_urls.append(candidate)
+
+            if combined_urls:
                 try:
-                    urls = [url.strip() for url in str(start_urls).split(",") if url.strip()]
                     max_chars = int(config.get("max_chars_per_page") or 5000)
                     timeout = int(config.get("timeout_seconds") or 15)
                     scraped = ""
+                    failures: List[str] = []
 
-                    for url in urls:
+                    for url in combined_urls:
                         try:
-                            response = await asyncio.to_thread(requests.get, url, timeout=timeout)
+                            response, fetch_failures = await asyncio.to_thread(
+                                _fetch_url_with_fallback,
+                                url,
+                                timeout_seconds=timeout,
+                                prefer_xml=False,
+                                language_hint=_resolve_accept_language(config.get("language_hint")),
+                                allow_common_feed_candidates=False,
+                            )
+                            failures.extend(fetch_failures[:1])
+                            if response is None:
+                                continue
                             soup = BeautifulSoup(response.text, "html.parser")
                             body_text = soup.get_text(" ", strip=True)
                             scraped += f"\n\nContent from {url}:\n{body_text[:max_chars]}"
                         except Exception:
                             continue
 
-                    extra_context = "\n\nScraped Content:\n" + scraped
+                    if scraped.strip():
+                        extra_context = "\n\nScraped Content:\n" + scraped
+                    elif failures:
+                        return {
+                            "answer": (
+                                "Web scraper could not fetch content from configured URLs. "
+                                f"Details: {' | '.join(failures[:3])}"
+                            ),
+                            "details": {"failures": failures[:10], "requested_urls": combined_urls},
+                        }
                 except Exception:
                     pass
         elif agent_type == "web_navigator":
@@ -2799,18 +3296,11 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     )
                 }
 
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-            }
-
             collected_links: List[Dict[str, str]] = []
+            seen_link_urls: set[str] = set()
             failures: List[str] = []
             requested_urls = navigation_urls[:max_nav_steps]
+            language_hint = _resolve_accept_language(config.get("language_hint"))
 
             for target_url in requested_urls:
                 _emit_step(
@@ -2822,22 +3312,23 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                     },
                 )
                 try:
-                    response = await asyncio.to_thread(
-                        requests.get,
+                    response, fetch_failures = await asyncio.to_thread(
+                        _fetch_url_with_fallback,
                         target_url,
-                        headers=headers,
-                        timeout=timeout_seconds,
-                        allow_redirects=True,
+                        timeout_seconds=timeout_seconds,
+                        prefer_xml=False,
+                        language_hint=language_hint,
+                        allow_common_feed_candidates=False,
                     )
-                    if not response.ok:
-                        failures.append(f"{target_url} -> HTTP {response.status_code}")
+                    failures.extend(fetch_failures[:2])
+                    if response is None:
                         _emit_step(
                             on_step,
                             {
                                 "status": "navigator_fetch_failed",
                                 "agent": agent_label,
                                 "url": target_url,
-                                "error": f"HTTP {response.status_code}",
+                                "error": fetch_failures[0] if fetch_failures else "Fetch failed",
                             },
                         )
                         continue
@@ -2853,14 +3344,72 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                         max_links=remaining,
                         same_domain_only=same_domain_only,
                     )
-                    collected_links.extend(links)
+                    if len(links) == 0:
+                        links = _extract_fallback_links_from_html(
+                            resolved_url,
+                            response.text,
+                            max_links=remaining,
+                            same_domain_only=same_domain_only,
+                        )
+
+                    if len(links) == 0:
+                        feed_candidates = _discover_feed_links_from_html(resolved_url, response.text, max_links=6)
+                        if len(feed_candidates) == 0:
+                            feed_candidates = _build_common_feed_candidates(resolved_url, max_links=6)
+                        for feed_url in feed_candidates:
+                            if len(links) >= remaining:
+                                break
+                            feed_response, feed_failures = await asyncio.to_thread(
+                                _fetch_url_with_fallback,
+                                feed_url,
+                                timeout_seconds=timeout_seconds,
+                                prefer_xml=True,
+                                language_hint=language_hint,
+                                allow_common_feed_candidates=False,
+                            )
+                            failures.extend(feed_failures[:1])
+                            if feed_response is None:
+                                continue
+                            entries = _extract_feed_entries_from_content(feed_response.content)
+                            if len(entries) == 0:
+                                continue
+                            for entry in entries:
+                                mapped = _entry_to_link_item(entry, feed_response.url or feed_url)
+                                if mapped is None:
+                                    continue
+                                mapped_url = mapped["url"]
+                                parsed = urlparse(mapped_url)
+                                if same_domain_only:
+                                    base_domain = urlparse(resolved_url).netloc.lower()
+                                    target_domain = parsed.netloc.lower()
+                                    if (
+                                        target_domain
+                                        and base_domain
+                                        and target_domain != base_domain
+                                        and not target_domain.endswith(f".{base_domain}")
+                                    ):
+                                        continue
+                                links.append(mapped)
+                                if len(links) >= remaining:
+                                    break
+
+                    pruned_links: List[Dict[str, str]] = []
+                    for link in links:
+                        normalized_url = str(link.get("url") or "").rstrip("/")
+                        if not normalized_url or normalized_url in seen_link_urls:
+                            continue
+                        seen_link_urls.add(normalized_url)
+                        pruned_links.append(link)
+                        if len(pruned_links) >= remaining:
+                            break
+                    collected_links.extend(pruned_links)
                     _emit_step(
                         on_step,
                         {
                             "status": "navigator_fetch_completed",
                             "agent": agent_label,
                             "url": resolved_url,
-                            "links_found": len(links),
+                            "links_found": len(pruned_links),
                         },
                     )
 
@@ -3161,6 +3710,172 @@ def _should_mark_agent_unavailable(error_text: str) -> bool:
     return any(marker in normalized for marker in permanent_markers)
 
 
+def _extract_terminal_failure_reason(text: str) -> str | None:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return None
+
+    if "workbook not found" in normalized and "auto_create_workbook" in normalized:
+        return "excel_workbook_missing"
+    if "requires the `openpyxl` dependency" in normalized or "requires the `python-docx` dependency" in normalized:
+        return "dependency_missing"
+    if "i’m sorry, but i can’t help with that" in normalized or "i'm sorry, but i can't help with that" in normalized:
+        return "capability_refusal"
+    if "can't browse the web" in normalized or "cannot browse the web" in normalized:
+        return "external_access_blocked"
+    if "cannot access external urls" in normalized or "cannot access external url" in normalized:
+        return "external_access_blocked"
+    if "http 403" in normalized or "403 forbidden" in normalized:
+        return "http_forbidden"
+    if "http 404" in normalized:
+        return "http_not_found"
+    if "invalid_url" in normalized:
+        return "invalid_input_url"
+    if "no valid url provided" in normalized:
+        return "invalid_input_url"
+    if "web navigation failed" in normalized and ("block" in normalized or "javascript rendering" in normalized):
+        return "external_access_blocked"
+    return None
+
+
+def _terminal_failure_threshold(reason: str) -> int:
+    thresholds = {
+        "dependency_missing": 1,
+        "capability_refusal": 1,
+        "external_access_blocked": 2,
+        "http_forbidden": 2,
+        "http_not_found": 2,
+        "invalid_input_url": 2,
+        "excel_workbook_missing": 2,
+    }
+    return thresholds.get(reason, 2)
+
+
+def _summarize_terminal_failures_for_user(failures: List[Dict[str, Any]]) -> str:
+    if not failures:
+        return "Task stopped because required agent actions repeatedly failed."
+
+    lines = ["I could not finish automatically because required agent actions repeatedly failed:"]
+    for failure in failures[:4]:
+        agent = str(failure.get("agent") or "agent")
+        reason = str(failure.get("reason") or "unknown_failure").replace("_", " ")
+        detail = str(failure.get("detail") or "").strip()
+        if detail:
+            lines.append(f"- {agent}: {reason} ({detail})")
+        else:
+            lines.append(f"- {agent}: {reason}")
+
+    lines.append("Please adjust configuration/inputs and retry.")
+    return "\n".join(lines)
+
+
+def _safe_json_loads(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(_extract_json_block(text))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+def _normalize_plan_graph(raw_plan: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_plan, list):
+        return []
+
+    nodes: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(raw_plan, start=1):
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("id") or item.get("task_id") or f"T{idx}").strip() or f"T{idx}"
+        if task_id in seen_ids:
+            continue
+        seen_ids.add(task_id)
+        description = str(item.get("task") or item.get("description") or "").strip()
+        if not description:
+            continue
+        status = str(item.get("status") or "pending").strip().lower()
+        if status not in {"pending", "running", "done", "blocked", "failed"}:
+            status = "pending"
+        depends_on_raw = item.get("depends_on") or item.get("dependencies") or []
+        depends_on: List[str] = []
+        if isinstance(depends_on_raw, list):
+            for dependency in depends_on_raw:
+                dep = str(dependency or "").strip()
+                if dep and dep != task_id:
+                    depends_on.append(dep)
+        success_criteria = str(item.get("success_criteria") or item.get("done_when") or "").strip()
+        nodes.append(
+            {
+                "id": task_id,
+                "task": description,
+                "depends_on": list(dict.fromkeys(depends_on)),
+                "status": status,
+                "success_criteria": success_criteria,
+            }
+        )
+    return nodes
+
+
+def _plan_graph_to_text(plan_graph: List[Dict[str, Any]]) -> str:
+    if not plan_graph:
+        return "No explicit DAG plan yet."
+    lines: List[str] = []
+    for node in plan_graph:
+        depends = ", ".join(node.get("depends_on") or []) or "none"
+        success = str(node.get("success_criteria") or "").strip()
+        base = (
+            f"- {node.get('id')}: {node.get('task')} "
+            f"[status={node.get('status')}, depends_on={depends}]"
+        )
+        if success:
+            base += f" | done_when={success}"
+        lines.append(base)
+    return "\n".join(lines)
+
+
+def _update_history_summary(current_summary: str, new_entry: str, max_chars: int = 3200) -> str:
+    base = str(current_summary or "").strip()
+    append = str(new_entry or "").strip()
+    if not append:
+        return base
+    merged = f"{base}\n{append}".strip() if base else append
+    return _clip_text(merged, max_chars=max_chars)
+
+
+def _default_definition_of_done(user_input: str) -> List[str]:
+    return [
+        "All required sub-goals from the user request are addressed.",
+        "No blocking dependency/error remains unresolved without explanation.",
+        "Final answer contains concrete outputs (results/files/links) or explicit missing-data reasons.",
+        f"Task remains aligned with user objective: { _clip_text(user_input, 240) }",
+    ]
+
+
+def _apply_plan_progress_from_outcomes(
+    plan_graph: List[Dict[str, Any]],
+    outcomes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not plan_graph:
+        return []
+    if not outcomes:
+        return plan_graph
+
+    updated = [dict(node) for node in plan_graph]
+    if any(bool(item.get("informative")) for item in outcomes):
+        for node in updated:
+            if node.get("status") in {"pending", "running"}:
+                node["status"] = "done"
+                break
+    elif all(item.get("terminal_reason") for item in outcomes):
+        for node in updated:
+            if node.get("status") in {"pending", "running"}:
+                node["status"] = "blocked"
+                break
+    return updated
+
+
 class ManagerState(TypedDict):
     input: str
     active_agents: List[Dict[str, Any]]
@@ -3180,6 +3895,11 @@ class ManagerState(TypedDict):
     attempted_call_signatures: set[str]
     current_plan: str
     plan_history: List[str]
+    terminal_failure_counts: Dict[int, Dict[str, int]]
+    history_summary: str
+    flight_plan: List[Dict[str, Any]]
+    plan_created: bool
+    definition_of_done: List[str]
 
 
 class MultiAgentManager:
@@ -3217,6 +3937,11 @@ class MultiAgentManager:
             "attempted_call_signatures": set(),
             "current_plan": "",
             "plan_history": [],
+            "terminal_failure_counts": {},
+            "history_summary": "",
+            "flight_plan": [],
+            "plan_created": False,
+            "definition_of_done": _default_definition_of_done(user_input),
         }
 
         def add_step(step: Dict[str, Any]) -> None:
@@ -3242,6 +3967,7 @@ class MultiAgentManager:
                 ],
                 "max_steps": state["max_steps"],
                 "max_agent_calls": state["max_agent_calls"],
+                "definition_of_done": state["definition_of_done"],
             }
         )
 
@@ -3314,87 +4040,245 @@ class MultiAgentManager:
                 for agent in current_state["active_agents"]
                 if (_safe_int(agent.get("id")) or -1) in current_state["unavailable_agents"]
             ]
-            previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 1600) or "No prior plan yet."
+            remaining_steps = max(current_state["max_steps"] - current_state["current_step"], 0)
+            remaining_calls = max(current_state["max_agent_calls"] - current_state["agent_calls_count"], 0)
+            previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 2000) or "No prior plan yet."
             recent_trace = _build_recent_manager_trace(current_state.get("steps") or [])
             manager_policy_prompt = _clip_text(
                 str(current_state.get("manager_config", {}).get("system_prompt") or ""),
                 2400,
             )
+            flight_plan_text = _plan_graph_to_text(current_state.get("flight_plan") or [])
+            history_summary = (
+                _clip_text(str(current_state.get("history_summary") or ""), 2600)
+                or "No summarized history yet."
+            )
+            dod_text = "\n".join(f"- {item}" for item in (current_state.get("definition_of_done") or []))
 
             add_step(
                 {
                     "status": "manager_iteration_start",
                     "iteration": current_state["current_step"] + 1,
-                    "remaining_steps": max(current_state["max_steps"] - current_state["current_step"], 0),
-                    "remaining_agent_calls": max(
-                        current_state["max_agent_calls"] - current_state["agent_calls_count"],
-                        0,
-                    ),
+                    "remaining_steps": remaining_steps,
+                    "remaining_agent_calls": remaining_calls,
                     "current_plan": previous_plan,
                 }
             )
 
-            manager_prompt = f"""You are an advanced Multi-Agent Orchestrator.
-Available agents catalog (always use agent_id when possible and only choose from this list):
+            if remaining_steps <= 2 or remaining_calls <= 2:
+                add_step(
+                    {
+                        "status": "manager_guardrail_warning",
+                        "remaining_steps": remaining_steps,
+                        "remaining_agent_calls": remaining_calls,
+                        "message": (
+                            "Budget is nearly exhausted. Finalize decisively and avoid optional calls."
+                        ),
+                    }
+                )
+
+            planner_prompt = f"""You are an advanced Multi-Agent Orchestrator using strict ReAct.
+
+MANDATORY LOOP EACH ITERATION:
+1) THOUGHT (private): reason about the objective and constraints.
+2) ACTION: choose exactly one tool among create_plan, update_plan, dispatch_agents, finish_task.
+3) OBSERVATION EXPECTED: explain what evidence should be produced by that action.
+
+RULES:
+- First iteration MUST call create_plan.
+- Plan must be represented as DAG JSON (tasks + dependencies + statuses).
+- Keep a compact scratchpad, not full transcript.
+- Never dispatch an identical call already attempted.
+- After each subordinate-agent result, re-evaluate whether the current step objective is met.
+- If a tool fails, analyze cause and pick an alternative approach (no blind retry loops).
+- finish_task is the only valid way to stop.
+- Respect hard limits. If budget is low, prioritize closure.
+
+Definition of Done (all criteria should be checked before finish_task):
+{dod_text}
+
+Available agents catalog:
 {json.dumps(agent_catalog, ensure_ascii=False, indent=2)}
 
 Unavailable agents (DO NOT CALL):
 {json.dumps(unavailable_summary, ensure_ascii=False, indent=2)}
 
-Manager operating prompt (must follow):
+Manager operating prompt:
 {manager_policy_prompt or "No custom manager prompt provided. Use best orchestration practices."}
 
 Execution budget:
 - max_steps: {current_state["max_steps"]}
 - current_step: {current_state["current_step"]}
+- remaining_steps: {remaining_steps}
 - max_agent_calls: {current_state["max_agent_calls"]}
 - agent_calls_used: {current_state["agent_calls_count"]}
-- agent_calls_remaining: {max(current_state["max_agent_calls"] - current_state["agent_calls_count"], 0)}
+- agent_calls_remaining: {remaining_calls}
 
-Previous plan from last iteration:
+Current flight plan (DAG):
+{flight_plan_text}
+
+Previous plan:
 {previous_plan}
 
-Recent execution trace:
+Recent trace:
 {recent_trace}
 
-Current Conversation History & Knowledge:
-{current_state['conversation_history']}
+Summarized history:
+{history_summary}
 
-Shared Memory (Scratchpad):
+Shared scratchpad:
 {json.dumps(current_state['scratchpad'], indent=2)}
 
-CRITICAL INSTRUCTIONS FOR LARGE DATA/SCHEMAS:
-1. Do not assume schema structures. Anticipate multiple phases:
-   - Phase 1 (Discovery): Query table names, metadata, or file lists.
-   - Phase 2 (Inspection): Query specific column definitions, data types, or file samples.
-   - Phase 3 (Execution): Run the targeted SQL or data extraction.
-   - Phase 4 (Synthesis): Analyze and format the final result.
-2. At EVERY step, re-evaluate your plan based on the new knowledge acquired. Optimize the next calls and avoid redundant repeated calls.
-3. You can call multiple agents in parallel if needed (Map-Reduce), but stay within budget.
-4. Do NOT send the entire conversation history to agents. Extract ONLY the relevant context and pass it in the "input" field.
-5. You can update the "scratchpad" to store variables (schema, metrics, intermediate findings).
-6. If you have enough information, return "final_answer" immediately.
-7. For `clickhouse_specific` agents, provide explicit `query_name` and `params` whenever possible.
-8. You MUST re-check and refine your plan every iteration. Include what changed compared with the previous plan.
-9. Never re-dispatch an identical call (same agent + same input + same params context) already attempted before.
-
-Decide the next step. Return ONLY a valid JSON object with the following structure:
+Return ONLY JSON:
 {{
-  "status": "thinking" | "calling_agent" | "final_answer",
-  "current_plan": "Your updated step-by-step plan based on current knowledge",
-  "plan_revision": "What changed vs previous plan, or why unchanged",
-  "focus_check": "One-line reminder of current objective and open items",
-  "rationale": "Why you are making this decision and how it optimizes the plan",
-  "scratchpad_updates": {{ "key": "value" }},
-  "calls": [{{"agent_id": 1, "agent_name": "optional fallback", "agent_type": "optional", "input": "highly detailed instruction with only required context", "query_name": "optional for clickhouse_specific", "params": {{"P1": "value"}}}}],
-  "final_answer": "The comprehensive final answer to the user",
-  "missing_information": "Any info you still need to proceed"
+  "tool": "create_plan|update_plan|dispatch_agents|finish_task",
+  "private_reasoning": "internal CoT, concise but explicit (not for end user display)",
+  "observation_expected": "what evidence is expected after action",
+  "current_plan": "updated flight plan summary",
+  "dag_plan": [{{"id":"T1","task":"...","depends_on":[],"status":"pending","success_criteria":"..."}}],
+  "plan_revision": "what changed vs previous plan",
+  "focus_check": "one-line focus reminder",
+  "rationale": "brief external-safe rationale",
+  "scratchpad_updates": {{"key":"value"}},
+  "calls": [{{"agent_id":1,"agent_name":"optional","agent_type":"optional","input":"targeted instruction","query_name":"optional","params":{{"P1":"value"}}}}],
+  "definition_of_done_check": [{{"criterion":"...","satisfied":true,"evidence":"..."}}],
+  "final_answer": "required when tool=finish_task",
+  "missing_information": "optional"
 }}"""
 
             try:
-                response = await current_state["llm"].ainvoke([HumanMessage(content=manager_prompt)])
-                content = _coerce_message_content(response.content)
-                decision = json.loads(_extract_json_block(content))
+                planner_response = await current_state["llm"].ainvoke([HumanMessage(content=planner_prompt)])
+                planner_content = _coerce_message_content(planner_response.content)
+                planner_decision = _safe_json_loads(planner_content)
+
+                if not planner_decision:
+                    raise ValueError("Planner returned non-JSON or invalid decision.")
+
+                selected_tool = str(planner_decision.get("tool") or "").strip().lower()
+                if not current_state.get("plan_created") and selected_tool != "create_plan":
+                    planner_decision["tool"] = "create_plan"
+                    if not isinstance(planner_decision.get("dag_plan"), list):
+                        planner_decision["dag_plan"] = [
+                            {
+                                "id": "T1",
+                                "task": "Understand the request and create an execution plan.",
+                                "depends_on": [],
+                                "status": "pending",
+                                "success_criteria": "A valid DAG plan exists.",
+                            },
+                            {
+                                "id": "T2",
+                                "task": "Execute the plan with relevant agents.",
+                                "depends_on": ["T1"],
+                                "status": "pending",
+                                "success_criteria": "Evidence gathered from agent outputs.",
+                            },
+                            {
+                                "id": "T3",
+                                "task": "Synthesize and finalize answer with finish_task.",
+                                "depends_on": ["T2"],
+                                "status": "pending",
+                                "success_criteria": "Final answer submitted.",
+                            },
+                        ]
+                    planner_decision["plan_revision"] = "create_plan enforced because plan creation is mandatory first."
+                    selected_tool = "create_plan"
+
+                critic_prompt = f"""You are a strict execution critic for a multi-agent manager.
+Review the planner decision and return whether it should be approved or revised.
+
+Rules:
+- Enforce ReAct consistency (thought -> action -> expected observation).
+- Ensure first action is create_plan if no flight plan exists.
+- Ensure chosen action respects remaining step/call budget.
+- Prevent redundant calls or blind retries.
+- If planner asks to finish, verify Definition of Done evidence is sufficient.
+
+Current context summary:
+- remaining_steps: {remaining_steps}
+- remaining_agent_calls: {remaining_calls}
+- plan_created: {bool(current_state.get("plan_created"))}
+- previous_plan: {previous_plan}
+- flight_plan: {flight_plan_text}
+- history_summary: {history_summary}
+
+Planner decision JSON:
+{json.dumps(planner_decision, ensure_ascii=False, indent=2)}
+
+Return ONLY JSON:
+{{
+  "verdict": "approve|revise",
+  "feedback": "short critical feedback",
+  "revised_decision": {{
+    "tool": "create_plan|update_plan|dispatch_agents|finish_task",
+    "current_plan": "optional",
+    "dag_plan": [{{"id":"T1","task":"...","depends_on":[],"status":"pending","success_criteria":"..."}}],
+    "calls": [],
+    "final_answer": "",
+    "focus_check": "",
+    "rationale": "",
+    "plan_revision": "",
+    "definition_of_done_check": []
+  }}
+}}"""
+                critic_response = await current_state["llm"].ainvoke([HumanMessage(content=critic_prompt)])
+                critic_content = _coerce_message_content(critic_response.content)
+                critic_decision = _safe_json_loads(critic_content)
+
+                decision: Dict[str, Any] = dict(planner_decision)
+                critic_verdict = str(critic_decision.get("verdict") or "").strip().lower()
+                revised_decision = critic_decision.get("revised_decision")
+                if critic_verdict == "revise" and isinstance(revised_decision, dict):
+                    decision = {**decision, **revised_decision}
+                    add_step(
+                        {
+                            "status": "manager_critique",
+                            "verdict": "revise",
+                            "feedback": _clip_text(str(critic_decision.get("feedback") or ""), 800),
+                        }
+                    )
+                else:
+                    add_step(
+                        {
+                            "status": "manager_critique",
+                            "verdict": "approve",
+                            "feedback": _clip_text(str(critic_decision.get("feedback") or ""), 800),
+                        }
+                    )
+
+                tool = str(decision.get("tool") or "").strip().lower()
+                if tool in {"dispatch_agents", "dispatch", "call_agents", "act"}:
+                    decision["status"] = "calling_agent"
+                elif tool in {"finish_task", "submit_final_answer"}:
+                    decision["status"] = "final_answer"
+                else:
+                    decision["status"] = "thinking"
+
+                normalized_plan_graph = _normalize_plan_graph(decision.get("dag_plan"))
+                if tool in {"create_plan", "update_plan"} and normalized_plan_graph:
+                    current_state["flight_plan"] = normalized_plan_graph
+                    current_state["plan_created"] = True
+                elif tool == "create_plan" and not normalized_plan_graph and not current_state["plan_created"]:
+                    fallback_plan = _normalize_plan_graph(
+                        [
+                            {
+                                "id": "T1",
+                                "task": "Gather required evidence via specialized agents.",
+                                "depends_on": [],
+                                "status": "pending",
+                                "success_criteria": "Evidence collected.",
+                            },
+                            {
+                                "id": "T2",
+                                "task": "Synthesize and finish task.",
+                                "depends_on": ["T1"],
+                                "status": "pending",
+                                "success_criteria": "Final answer submitted with evidence.",
+                            },
+                        ]
+                    )
+                    current_state["flight_plan"] = fallback_plan
+                    current_state["plan_created"] = True
 
                 updates = decision.get("scratchpad_updates")
                 if isinstance(updates, dict):
@@ -3402,6 +4286,8 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
 
                 rationale = _clip_text(str(decision.get("rationale") or ""), 2000)
                 raw_plan = _clip_text(str(decision.get("current_plan") or ""), 3000)
+                if not raw_plan and current_state.get("flight_plan"):
+                    raw_plan = _plan_graph_to_text(current_state["flight_plan"])
                 previous_plan = _clip_text(str(current_state.get("current_plan") or ""), 3000)
                 plan = raw_plan or previous_plan or "No explicit plan provided."
                 plan_revision = _clip_text(str(decision.get("plan_revision") or ""), 1200) or _plan_revision_summary(
@@ -3412,9 +4298,35 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                 current_state["current_plan"] = plan
                 current_state["plan_history"].append(plan)
 
+                dod_checks = decision.get("definition_of_done_check")
+                if (
+                    decision.get("status") == "final_answer"
+                    and isinstance(dod_checks, list)
+                    and remaining_steps > 1
+                ):
+                    unsatisfied = [
+                        item
+                        for item in dod_checks
+                        if isinstance(item, dict) and not bool(item.get("satisfied"))
+                    ]
+                    if unsatisfied:
+                        decision["status"] = "thinking"
+                        decision["tool"] = "update_plan"
+                        add_step(
+                            {
+                                "status": "manager_warning",
+                                "message": (
+                                    "finish_task rejected because Definition of Done is not fully satisfied yet."
+                                ),
+                                "unsatisfied_criteria": unsatisfied[:5],
+                            }
+                        )
+
                 add_step(
                     {
                         "status": "manager_decision",
+                        "tool": str(decision.get("tool") or ""),
+                        "observation_expected": _clip_text(str(decision.get("observation_expected") or ""), 1200),
                         "rationale": rationale,
                         "plan": plan,
                         "plan_revision": plan_revision,
@@ -3426,6 +4338,13 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                     f"[Manager Plan Revision]: {plan_revision}\n"
                     f"[Manager Focus Check]: {focus_check}\n"
                     f"[Manager Rationale]: {rationale}\n"
+                )
+                current_state["history_summary"] = _update_history_summary(
+                    current_state.get("history_summary") or "",
+                    (
+                        f"Step {current_state['current_step'] + 1}: "
+                        f"tool={decision.get('tool')} | plan_revision={plan_revision} | focus={focus_check}"
+                    ),
                 )
 
                 if decision.get("status") == "final_answer":
@@ -3552,7 +4471,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                 call_input: str,
                                 call_context: Dict[str, Any],
                                 call_signature: str,
-                            ) -> str:
+                            ) -> Dict[str, Any]:
                                 selected_id = _safe_int(selected.get("id"))
                                 add_step(
                                     {
@@ -3588,10 +4507,42 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                     if result.get("sql"):
                                         add_step({"status": "sql_generated", "sql": result["sql"]})
                                     answer_text = str(result.get("answer") or "").strip()
-                                    if answer_text:
+                                    terminal_reason = _extract_terminal_failure_reason(answer_text)
+                                    if answer_text and not terminal_reason:
                                         current_state["successful_call_signatures"].add(call_signature)
+                                    marked_unavailable = False
+
+                                    if terminal_reason and selected_id is not None:
+                                        per_agent = current_state["terminal_failure_counts"].setdefault(selected_id, {})
+                                        reason_count = int(per_agent.get(terminal_reason, 0)) + 1
+                                        per_agent[terminal_reason] = reason_count
+                                        add_step(
+                                            {
+                                                "status": "agent_terminal_failure",
+                                                "agent": selected.get("name"),
+                                                "agent_id": selected_id,
+                                                "reason": terminal_reason,
+                                                "count": reason_count,
+                                                "message": answer_text[:500],
+                                            }
+                                        )
+                                        if reason_count >= _terminal_failure_threshold(terminal_reason):
+                                            current_state["unavailable_agents"][selected_id] = (
+                                                f"Repeated terminal failure ({terminal_reason}): {answer_text[:500]}"
+                                            )
+                                            marked_unavailable = True
+                                            add_step(
+                                                {
+                                                    "status": "agent_marked_unavailable",
+                                                    "agent": selected.get("name"),
+                                                    "agent_id": selected_id,
+                                                    "reason": current_state["unavailable_agents"][selected_id],
+                                                }
+                                            )
+
                                     if _should_mark_agent_unavailable(answer_text) and selected_id is not None:
                                         current_state["unavailable_agents"][selected_id] = answer_text[:500]
+                                        marked_unavailable = True
                                         add_step(
                                             {
                                                 "status": "agent_marked_unavailable",
@@ -3600,9 +4551,23 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                                 "reason": answer_text,
                                             }
                                         )
-                                    return f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n"
+                                    informative = bool(
+                                        answer_text
+                                        and not terminal_reason
+                                        and not _is_generic_orchestration_text(answer_text)
+                                    )
+                                    return {
+                                        "trace": f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n",
+                                        "informative": informative,
+                                        "terminal_reason": terminal_reason,
+                                        "marked_unavailable": marked_unavailable,
+                                        "agent": selected.get("name"),
+                                        "detail": answer_text[:500],
+                                    }
                                 except Exception as exc:
                                     error_text = str(exc)
+                                    terminal_reason = _extract_terminal_failure_reason(error_text)
+                                    marked_unavailable = False
                                     add_step(
                                         {
                                             "status": "agent_call_failed",
@@ -3611,8 +4576,36 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                             "error": error_text,
                                         }
                                     )
+                                    if terminal_reason and selected_id is not None:
+                                        per_agent = current_state["terminal_failure_counts"].setdefault(selected_id, {})
+                                        reason_count = int(per_agent.get(terminal_reason, 0)) + 1
+                                        per_agent[terminal_reason] = reason_count
+                                        add_step(
+                                            {
+                                                "status": "agent_terminal_failure",
+                                                "agent": selected.get("name"),
+                                                "agent_id": selected_id,
+                                                "reason": terminal_reason,
+                                                "count": reason_count,
+                                                "message": error_text[:500],
+                                            }
+                                        )
+                                        if reason_count >= _terminal_failure_threshold(terminal_reason):
+                                            current_state["unavailable_agents"][selected_id] = (
+                                                f"Repeated terminal failure ({terminal_reason}): {error_text[:500]}"
+                                            )
+                                            marked_unavailable = True
+                                            add_step(
+                                                {
+                                                    "status": "agent_marked_unavailable",
+                                                    "agent": selected.get("name"),
+                                                    "agent_id": selected_id,
+                                                    "reason": current_state["unavailable_agents"][selected_id],
+                                                }
+                                            )
                                     if _should_mark_agent_unavailable(error_text) and selected_id is not None:
                                         current_state["unavailable_agents"][selected_id] = error_text[:500]
+                                        marked_unavailable = True
                                         add_step(
                                             {
                                                 "status": "agent_marked_unavailable",
@@ -3621,17 +4614,135 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                                                 "reason": error_text,
                                             }
                                         )
-                                    return f"\nAgent {selected.get('name')} failed: {exc}\n"
+                                    return {
+                                        "trace": f"\nAgent {selected.get('name')} failed: {exc}\n",
+                                        "informative": False,
+                                        "terminal_reason": terminal_reason,
+                                        "marked_unavailable": marked_unavailable,
+                                        "agent": selected.get("name"),
+                                        "detail": error_text[:500],
+                                    }
 
-                            results = await asyncio.gather(
+                            outcomes = await asyncio.gather(
                                 *(
                                     execute_call(call, selected, call_input, call_context, signature)
                                     for call, selected, call_input, call_context, signature in resolved_calls
                                 )
                             )
-                            current_state["conversation_history"] += "".join(results)
+                            current_state["conversation_history"] += "".join(
+                                str(item.get("trace") or "") for item in outcomes
+                            )
+                            current_state["flight_plan"] = _apply_plan_progress_from_outcomes(
+                                current_state.get("flight_plan") or [],
+                                outcomes,
+                            )
+
+                            try:
+                                reflection_payload = [
+                                    {
+                                        "agent": item.get("agent"),
+                                        "informative": bool(item.get("informative")),
+                                        "terminal_reason": item.get("terminal_reason"),
+                                        "marked_unavailable": bool(item.get("marked_unavailable")),
+                                        "detail": _clip_text(str(item.get("detail") or ""), 400),
+                                    }
+                                    for item in outcomes
+                                ]
+                                reflection_prompt = f"""You are the reflection module of a multi-agent manager.
+Evaluate the latest agent outcomes and decide whether the current plan needs adjustment.
+
+Task objective:
+{_clip_text(str(current_state.get("input") or ""), 500)}
+
+Current plan:
+{_clip_text(str(current_state.get("current_plan") or ""), 2000)}
+
+Current flight plan (DAG):
+{_plan_graph_to_text(current_state.get("flight_plan") or [])}
+
+Latest outcomes:
+{json.dumps(reflection_payload, ensure_ascii=False, indent=2)}
+
+Return ONLY JSON:
+{{
+  "step_objective_met": true,
+  "reflection": "short analysis",
+  "plan_adjustment_needed": false,
+  "updated_plan": "optional revised plan text",
+  "updated_dag_plan": [{{"id":"T1","task":"...","depends_on":[],"status":"pending","success_criteria":"..."}}],
+  "next_focus": "what to do next"
+}}"""
+                                reflection_response = await current_state["llm"].ainvoke(
+                                    [HumanMessage(content=reflection_prompt)]
+                                )
+                                reflection_content = _coerce_message_content(reflection_response.content)
+                                reflection = _safe_json_loads(reflection_content)
+                                if reflection:
+                                    updated_plan = _clip_text(str(reflection.get("updated_plan") or ""), 2600)
+                                    if updated_plan:
+                                        current_state["current_plan"] = updated_plan
+                                        current_state["plan_history"].append(updated_plan)
+                                    updated_dag = _normalize_plan_graph(reflection.get("updated_dag_plan"))
+                                    if updated_dag:
+                                        current_state["flight_plan"] = updated_dag
+                                        current_state["plan_created"] = True
+                                    reflection_text = _clip_text(str(reflection.get("reflection") or ""), 1200)
+                                    next_focus = _clip_text(str(reflection.get("next_focus") or ""), 800)
+                                    add_step(
+                                        {
+                                            "status": "manager_reflection",
+                                            "step_objective_met": bool(reflection.get("step_objective_met")),
+                                            "plan_adjustment_needed": bool(reflection.get("plan_adjustment_needed")),
+                                            "reflection": reflection_text,
+                                            "next_focus": next_focus,
+                                        }
+                                    )
+                                    current_state["history_summary"] = _update_history_summary(
+                                        current_state.get("history_summary") or "",
+                                        (
+                                            "Observation: "
+                                            f"{reflection_text or 'No reflection text provided.'} "
+                                            f"Next focus: {next_focus or 'Continue with current plan.'}"
+                                        ),
+                                    )
+                            except Exception as reflection_exc:
+                                add_step(
+                                    {
+                                        "status": "manager_reflection_failed",
+                                        "error": str(reflection_exc),
+                                    }
+                                )
+
+                            informative_outcomes = [item for item in outcomes if bool(item.get("informative"))]
+                            if len(informative_outcomes) == 0:
+                                terminal_outcomes = [
+                                    item for item in outcomes if item.get("terminal_reason")
+                                ]
+                                if len(terminal_outcomes) > 0 and all(bool(item.get("marked_unavailable")) for item in terminal_outcomes):
+                                    current_state["final_answer"] = _summarize_terminal_failures_for_user(
+                                        [
+                                            {
+                                                "agent": item.get("agent"),
+                                                "reason": item.get("terminal_reason"),
+                                                "detail": item.get("detail"),
+                                            }
+                                            for item in terminal_outcomes
+                                        ]
+                                    )
+                                    add_step(
+                                        {
+                                            "status": "manager_final",
+                                            "answer": current_state["final_answer"],
+                                            "manager_summary": "Stopped after repeated terminal agent failures.",
+                                        }
+                                    )
+                                    current_state["done"] = True
                 else:
                     current_state["conversation_history"] += f"\nManager thought: {rationale}\n"
+                    current_state["history_summary"] = _update_history_summary(
+                        current_state.get("history_summary") or "",
+                        f"Step {current_state['current_step'] + 1}: no dispatch. rationale={_clip_text(rationale, 500)}",
+                    )
 
             except Exception as exc:
                 add_step({"status": "error", "message": f"Manager error: {exc}"})
