@@ -196,6 +196,15 @@ export default function Chat() {
     });
   };
 
+  const resolveDefaultAgentId = (agentList: any[]): string => {
+    if (!Array.isArray(agentList) || agentList.length === 0) return '';
+    const manager = agentList.find(agent => String(agent?.agent_type || '').toLowerCase() === 'manager');
+    if (manager?.id != null) {
+      return String(manager.id);
+    }
+    return String(agentList[0].id);
+  };
+
   const fetchAgents = async (): Promise<any[]> => {
     const res = await fetch('/api/agents');
     if (!res.ok) {
@@ -242,7 +251,7 @@ export default function Chat() {
         if (first.agent_id) {
           setSelectedAgentId(String(first.agent_id));
         } else if (agentData.length > 0) {
-          setSelectedAgentId(String(agentData[0].id));
+          setSelectedAgentId(resolveDefaultAgentId(agentData));
         }
 
         const detail = await fetchThreadDetail(first.id);
@@ -251,7 +260,7 @@ export default function Chat() {
       }
 
       if (agentData.length > 0) {
-        setSelectedAgentId(String(agentData[0].id));
+        setSelectedAgentId(resolveDefaultAgentId(agentData));
       }
       setMessages([]);
     } catch (e: any) {
@@ -288,7 +297,7 @@ export default function Chat() {
   };
 
   const createThread = async (): Promise<ChatThreadSummary | null> => {
-    const fallbackAgentId = agents.length > 0 ? String(agents[0].id) : '';
+    const fallbackAgentId = resolveDefaultAgentId(agents);
     const agentId = selectedAgentId || fallbackAgentId;
 
     if (!agentId) {
