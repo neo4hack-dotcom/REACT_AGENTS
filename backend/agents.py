@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, List, TypedDict
@@ -1074,11 +1075,184 @@ def _resolve_safe_managed_file_path(
     return str(resolved)
 
 
-def _resolve_excel_workbook_path(config: Dict[str, Any], workbook_path: str | None = None) -> str:
-    configured_workbook = str(config.get("workbook_path") or "").strip()
-    requested_workbook = str(workbook_path or "").strip()
+def _is_instructional_excel_workbook_value(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if re.search(r"\.(xlsx|xlsm|xltx|xltm)$", lowered):
+        return False
+    if "/" in raw or "\\" in raw:
+        return False
+    word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9_'-]+", raw))
+    instruction_markers = (
+        "ia",
+        "ai",
+        "decide",
+        "décide",
+        "choisit",
+        "choose",
+        "context",
+        "contexte",
+        "folder",
+        "dossier",
+    )
+    return word_count >= 5 and (len(raw) > 30 or any(marker in lowered for marker in instruction_markers))
+
+
+def _normalize_excel_workbook_preference(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if _is_instructional_excel_workbook_value(raw):
+        return ""
+    return raw
+
+
+def _excel_manager_uses_auto_workbook_selection(config: Dict[str, Any]) -> bool:
+    mode = str(config.get("workbook_path_mode") or "").strip().lower()
+    if mode in {"auto", "auto_in_folder", "dynamic", "llm_decides", "ia_decide"}:
+        return True
+    configured = str(config.get("workbook_path") or "").strip()
+    return _is_instructional_excel_workbook_value(configured)
+
+
+def _list_excel_workbooks_in_root(root_path: str) -> List[Path]:
+    root = Path(root_path)
+    suffixes = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+    workbooks: List[Path] = []
+    try:
+        for item in root.iterdir():
+            if not item.is_file():
+                continue
+            if item.suffix.lower() not in suffixes:
+                continue
+            workbooks.append(item)
+    except Exception:
+        return []
+
+    workbooks.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return workbooks
+
+
+def _choose_auto_excel_workbook_candidate(
+    root_path: str,
+    action_name: str,
+    allow_overwrite: bool,
+) -> str:
+    existing = _list_excel_workbooks_in_root(root_path)
+    normalized_action = str(action_name or "").strip().lower()
+
+    if normalized_action == "create_workbook":
+        if existing and allow_overwrite:
+            return str(existing[0])
+        if not allow_overwrite:
+            index = 1
+            while True:
+                candidate = Path(root_path) / f"workbook_{index}.xlsx"
+                if not candidate.exists():
+                    return str(candidate)
+                index += 1
+
+    if existing:
+        return str(existing[0])
+
+    return str(Path(root_path) / "workbook_auto.xlsx")
+
+
+def _is_instructional_excel_sheet_value(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if len(raw) <= 31 and re.fullmatch(r"[A-Za-z0-9 _-]{1,31}", raw):
+        return False
+    lowered = raw.lower()
+    markers = ("ia", "ai", "decide", "décide", "context", "contexte", "choose", "choisit")
+    word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9_'-]+", raw))
+    return word_count >= 4 and any(marker in lowered for marker in markers)
+
+
+def _normalize_excel_sheet_preference(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if _is_instructional_excel_sheet_value(raw):
+        return ""
+    return raw
+
+
+def _excel_manager_uses_auto_sheet_selection(config: Dict[str, Any]) -> bool:
+    mode = str(config.get("default_sheet_mode") or "").strip().lower()
+    if mode in {"auto", "auto_from_context", "dynamic", "llm_decides", "ia_decide"}:
+        return True
+    configured = str(config.get("default_sheet") or "").strip()
+    return _is_instructional_excel_sheet_value(configured)
+
+
+def _resolve_excel_default_sheet(config: Dict[str, Any]) -> str:
+    normalized = _normalize_excel_sheet_preference(str(config.get("default_sheet") or ""))
+    return normalized or "Sheet1"
+
+
+def _resolve_excel_sheet_name_for_action(
+    workbook: Any,
+    action: Dict[str, Any],
+    default_sheet: str,
+    auto_sheet_selection: bool,
+    action_name: str,
+) -> str:
+    explicit_sheet = _normalize_excel_sheet_preference(str(action.get("sheet") or ""))
+    if explicit_sheet:
+        return explicit_sheet[:31] or "Sheet1"
+
+    sheet_names = list(getattr(workbook, "sheetnames", []) or [])
+    if auto_sheet_selection and len(sheet_names) > 0:
+        active_name = ""
+        try:
+            active_name = str(workbook.active.title or "").strip()
+        except Exception:
+            active_name = ""
+        if active_name and active_name in sheet_names:
+            return active_name[:31]
+        return str(sheet_names[0])[:31]
+
+    if str(action_name or "").strip().lower() == "create_sheet" and len(sheet_names) > 0:
+        base = (default_sheet or "Sheet1").strip()[:31] or "Sheet1"
+        if base not in sheet_names:
+            return base
+        index = 2
+        while True:
+            suffix = f"_{index}"
+            candidate = f"{base[: max(1, 31 - len(suffix))]}{suffix}"
+            if candidate not in sheet_names:
+                return candidate
+            index += 1
+
+    return (default_sheet or "Sheet1").strip()[:31] or "Sheet1"
+
+
+def _resolve_excel_workbook_path(
+    config: Dict[str, Any],
+    workbook_path: str | None = None,
+    *,
+    action_name: str | None = None,
+) -> str:
+    configured_workbook = _normalize_excel_workbook_preference(str(config.get("workbook_path") or ""))
+    requested_workbook = _normalize_excel_workbook_preference(str(workbook_path or ""))
     root_path = _resolve_managed_root_path(config, default_subdir="data/spreadsheets")
-    raw_path = requested_workbook or configured_workbook or "data.xlsx"
+
+    auto_workbook_selection = _excel_manager_uses_auto_workbook_selection(config)
+    if requested_workbook:
+        raw_path = requested_workbook
+    elif auto_workbook_selection:
+        raw_path = _choose_auto_excel_workbook_candidate(
+            root_path=root_path,
+            action_name=str(action_name or ""),
+            allow_overwrite=bool(config.get("allow_overwrite")),
+        )
+    else:
+        raw_path = configured_workbook or "data.xlsx"
+
     resolved = _resolve_safe_managed_file_path(
         root_path=root_path,
         raw_path=raw_path,
@@ -1238,7 +1412,7 @@ def _normalize_excel_actions(
 
     text = (user_input or "").strip()
     lowered = text.lower()
-    default_sheet = str(config.get("default_sheet") or "Sheet1")
+    default_sheet = _resolve_excel_default_sheet(config)
     workbook_hint = _guess_workbook_path_from_text(text)
     heuristics: List[Dict[str, Any]] = []
 
@@ -1316,10 +1490,11 @@ async def _execute_excel_actions(
             )
         }
 
-    default_sheet = str(config.get("default_sheet") or "Sheet1")
+    default_sheet = _resolve_excel_default_sheet(config)
     auto_create_workbook = bool(config.get("auto_create_workbook"))
     allow_overwrite = bool(config.get("allow_overwrite"))
     max_rows_read = int(config.get("max_rows_read") or 100)
+    auto_sheet_selection = _excel_manager_uses_auto_sheet_selection(config)
     lowered_request = (user_input or "").lower()
     request_forces_auto_create = bool(
         re.search(r"auto[_\s-]*create[_\s-]*workbook", lowered_request)
@@ -1340,7 +1515,11 @@ async def _execute_excel_actions(
             default=(auto_create_workbook or request_forces_auto_create),
         )
         try:
-            workbook_path = _resolve_excel_workbook_path(config, action.get("workbook_path"))
+            workbook_path = _resolve_excel_workbook_path(
+                config,
+                action.get("workbook_path"),
+                action_name=action_name,
+            )
         except Exception as exc:
             return {
                 "answer": f"Unable to resolve workbook path: {exc}",
@@ -1380,7 +1559,8 @@ async def _execute_excel_actions(
 
             workbook = openpyxl.Workbook()
             active = workbook.active
-            active.title = str(action.get("sheet") or default_sheet)[:31] or "Sheet1"
+            initial_sheet_name = _normalize_excel_sheet_preference(str(action.get("sheet") or "")) or default_sheet
+            active.title = initial_sheet_name[:31] or "Sheet1"
             workbook.save(workbook_path)
             operation_logs.append({"action": action_name, "status": "ok", "workbook_path": workbook_path})
             _emit_step(
@@ -1460,7 +1640,13 @@ async def _execute_excel_actions(
                 last_sheet_names = list(workbook.sheetnames)
                 operation_logs.append({"action": action_name, "status": "ok", "sheets": last_sheet_names})
             elif action_name == "create_sheet":
-                sheet_name = str(action.get("sheet") or default_sheet).strip()[:31] or "Sheet1"
+                sheet_name = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 if sheet_name in workbook.sheetnames:
                     operation_logs.append(
                         {"action": action_name, "status": "skipped", "reason": "Sheet already exists.", "sheet": sheet_name}
@@ -1470,7 +1656,13 @@ async def _execute_excel_actions(
                     changed = True
                     operation_logs.append({"action": action_name, "status": "ok", "sheet": sheet_name})
             elif action_name == "delete_sheet":
-                sheet_name = str(action.get("sheet") or default_sheet).strip()
+                sheet_name = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 if sheet_name not in workbook.sheetnames:
                     operation_logs.append(
                         {"action": action_name, "status": "skipped", "reason": "Sheet not found.", "sheet": sheet_name}
@@ -1489,7 +1681,13 @@ async def _execute_excel_actions(
                     changed = True
                     operation_logs.append({"action": action_name, "status": "ok", "sheet": sheet_name})
             elif action_name == "rename_sheet":
-                source = str(action.get("sheet") or default_sheet).strip()
+                source = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 target = str(action.get("new_name") or "").strip()[:31]
                 if source not in workbook.sheetnames:
                     operation_logs.append(
@@ -1508,7 +1706,13 @@ async def _execute_excel_actions(
                     changed = True
                     operation_logs.append({"action": action_name, "status": "ok", "sheet": source, "new_name": target})
             elif action_name == "write_cells":
-                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                sheet_name = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 if sheet_name not in workbook.sheetnames:
                     workbook.create_sheet(title=sheet_name[:31])
                     changed = True
@@ -1531,7 +1735,13 @@ async def _execute_excel_actions(
                         {"action": action_name, "status": "ok", "sheet": sheet_name, "written_cells": written}
                     )
             elif action_name == "append_rows":
-                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                sheet_name = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 if sheet_name not in workbook.sheetnames:
                     workbook.create_sheet(title=sheet_name[:31])
                     changed = True
@@ -1552,14 +1762,20 @@ async def _execute_excel_actions(
                         {"action": action_name, "status": "skipped", "reason": "No rows payload provided.", "sheet": sheet_name}
                     )
             elif action_name == "read_sheet":
-                sheet_name = str(action.get("sheet") or default_sheet).strip() or default_sheet
+                sheet_name = _resolve_excel_sheet_name_for_action(
+                    workbook,
+                    action,
+                    default_sheet,
+                    auto_sheet_selection,
+                    action_name,
+                )
                 if sheet_name not in workbook.sheetnames:
                     operation_logs.append(
                         {"action": action_name, "status": "skipped", "reason": "Sheet not found.", "sheet": sheet_name}
                     )
                 else:
                     limit = int(action.get("max_rows") or max_rows_read)
-                    limit = max(1, min(limit, 5000))
+                    limit = max(1, min(limit, 10000))
                     sheet = workbook[sheet_name]
                     last_read_rows = []
                     for row in sheet.iter_rows(min_row=1, max_row=limit, values_only=True):
@@ -1602,11 +1818,115 @@ async def _execute_excel_actions(
     }
 
 
-def _resolve_word_document_path(config: Dict[str, Any], document_path: str | None = None) -> str:
+def _is_instructional_word_document_value(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if re.search(r"\.(docx|docm|dotx|dotm)$", lowered):
+        return False
+    if "/" in raw or "\\" in raw:
+        return False
+
+    word_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9_'-]+", raw))
+    instruction_markers = (
+        "je veux",
+        "i want",
+        "ia decide",
+        "ai decide",
+        "auto",
+        "folder",
+        "dossier",
+        "reste",
+        "remain",
+        "designe",
+        "designated",
+    )
+    return word_count >= 6 and (len(raw) > 40 or any(marker in lowered for marker in instruction_markers))
+
+
+def _normalize_word_document_preference(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if _is_instructional_word_document_value(raw):
+        return ""
+    return raw
+
+
+def _word_manager_uses_auto_document_selection(config: Dict[str, Any]) -> bool:
+    mode = str(config.get("document_path_mode") or "").strip().lower()
+    if mode in {"auto", "auto_in_folder", "dynamic", "llm_decides", "ia_decide"}:
+        return True
+
     configured_document = str(config.get("document_path") or "").strip()
-    requested_document = str(document_path or "").strip()
+    return _is_instructional_word_document_value(configured_document)
+
+
+def _list_word_documents_in_root(root_path: str) -> List[Path]:
+    root = Path(root_path)
+    suffixes = {".docx", ".docm", ".dotx", ".dotm"}
+    documents: List[Path] = []
+    try:
+        for item in root.iterdir():
+            if not item.is_file():
+                continue
+            if item.suffix.lower() not in suffixes:
+                continue
+            documents.append(item)
+    except Exception:
+        return []
+
+    documents.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return documents
+
+
+def _choose_auto_word_document_candidate(
+    root_path: str,
+    action_name: str,
+    allow_overwrite: bool,
+) -> str:
+    existing_documents = _list_word_documents_in_root(root_path)
+    normalized_action = str(action_name or "").strip().lower()
+
+    if normalized_action in {"read_document", "append_paragraphs", "replace_text", "delete_document"}:
+        if existing_documents:
+            return str(existing_documents[0])
+        return str(Path(root_path) / "report.docx")
+
+    if normalized_action in {"create_document", "write_paragraphs"}:
+        if existing_documents and allow_overwrite:
+            return str(existing_documents[0])
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return str(Path(root_path) / f"document_{timestamp}.docx")
+
+    if existing_documents:
+        return str(existing_documents[0])
+    return str(Path(root_path) / "report.docx")
+
+
+def _resolve_word_document_path(
+    config: Dict[str, Any],
+    document_path: str | None = None,
+    *,
+    action_name: str | None = None,
+) -> str:
+    configured_document = _normalize_word_document_preference(str(config.get("document_path") or ""))
+    requested_document = _normalize_word_document_preference(str(document_path or ""))
     root_path = _resolve_managed_root_path(config, default_subdir="data/documents")
-    raw_path = requested_document or configured_document or "report.docx"
+
+    auto_document_selection = _word_manager_uses_auto_document_selection(config)
+    if requested_document:
+        raw_path = requested_document
+    elif auto_document_selection:
+        raw_path = _choose_auto_word_document_candidate(
+            root_path=root_path,
+            action_name=str(action_name or ""),
+            allow_overwrite=bool(config.get("allow_overwrite")),
+        )
+    else:
+        raw_path = configured_document or "report.docx"
+
     resolved = _resolve_safe_managed_file_path(
         root_path=root_path,
         raw_path=raw_path,
@@ -1838,7 +2158,11 @@ async def _execute_word_actions(
     for action in actions:
         action_name = str(action.get("action") or "").strip().lower()
         try:
-            document_path = _resolve_word_document_path(config, action.get("document_path"))
+            document_path = _resolve_word_document_path(
+                config,
+                action.get("document_path"),
+                action_name=action_name,
+            )
         except Exception as exc:
             return {
                 "answer": f"Unable to resolve document path: {exc}",
@@ -3063,8 +3387,18 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 )
                 return excel_result
 
+            workbook_mode = "auto_in_folder" if _excel_manager_uses_auto_workbook_selection(config) else "fixed_path"
+            sheet_mode = "auto_from_context" if _excel_manager_uses_auto_sheet_selection(config) else "fixed_default"
+            workbook_label = str(config.get("workbook_path") or "").strip() or "auto"
+            if workbook_mode == "auto_in_folder":
+                workbook_label = "auto"
+            sheet_label = str(config.get("default_sheet") or "").strip() or "Sheet1"
+            if sheet_mode == "auto_from_context":
+                sheet_label = "auto"
             system_prompt = (
-                f"You are an Excel Manager. Workbook: {config.get('workbook_path')}.\n"
+                f"You are an Excel Manager. Folder: {config.get('folder_path')}. "
+                f"Workbook preference: {workbook_label} ({workbook_mode}). "
+                f"Default sheet preference: {sheet_label} ({sheet_mode}).\n"
                 "If the user asks to create/modify/delete workbook/sheets/cells, return JSON actions using this schema:\n"
                 "{ \"actions\": [ {\"action\": \"create_workbook|delete_workbook|list_sheets|create_sheet|delete_sheet|rename_sheet|write_cells|append_rows|read_sheet\", "
                 "\"workbook_path\": \"optional\", \"sheet\": \"optional\", \"new_name\": \"optional\", \"cells\": {\"A1\": \"value\"}, "
@@ -3084,8 +3418,14 @@ Return your response in JSON format: {{ "answer": "Cleaned email content..." }}"
                 )
                 return word_result
 
+            configured_document = str(config.get("document_path") or "").strip()
+            auto_document_mode = _word_manager_uses_auto_document_selection(config)
+            document_label = configured_document if configured_document else "auto"
+            if auto_document_mode:
+                document_label = "auto_in_folder"
             system_prompt = (
-                f"You are a Word Manager. Document: {config.get('document_path')}.\n"
+                f"You are a Word Manager. Folder: {config.get('folder_path')}. "
+                f"Document preference: {document_label}.\n"
                 "If the user asks to create/modify/delete/read document content, return JSON actions using this schema:\n"
                 "{ \"actions\": [ {\"action\": \"create_document|delete_document|read_document|write_paragraphs|append_paragraphs|replace_text\", "
                 "\"document_path\": \"optional\", \"paragraphs\": [\"line 1\", \"line 2\"], "
