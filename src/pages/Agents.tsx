@@ -7,6 +7,7 @@ const AGENT_TYPES = [
   { id: 'sql_analyst', name: 'SQL Analyst' },
   { id: 'clickhouse_table_manager', name: 'ClickHouse Table Manager' },
   { id: 'clickhouse_writer', name: 'ClickHouse Writer' },
+  { id: 'clickhouse_specific', name: 'ClickHouse Specific' },
   { id: 'unstructured_to_structured', name: 'Unstructured to Structured' },
   { id: 'email_cleaner', name: 'Email Cleaner' },
   { id: 'file_assistant', name: 'File Assistant' },
@@ -56,6 +57,24 @@ const AGENT_TEMPLATES: Record<string, any> = {
     role: "ClickHouse Data Writer",
     objectives: "Create temporary tables and insert buffer data. MUST prefix table names with 'agent_'.",
     persona: "Diligent, secure, and precise."
+  },
+  clickhouse_specific: {
+    config: {
+      default_query: "by_uuid",
+      query_templates: [
+        {
+          name: "by_uuid",
+          description: "Fetch rows by UUID.",
+          sql: "SELECT * FROM my_table WHERE UUID = {P1} LIMIT 100",
+          parameters: [
+            { name: "P1", required: true, quote: "string", description: "Target UUID value." }
+          ]
+        }
+      ]
+    },
+    role: "ClickHouse Specific Query Runner",
+    objectives: "Use predefined SQL templates with placeholders (P1, P2, ...) and render a safe final SQL query from runtime parameters.",
+    persona: "Deterministic, strict, and SQL-focused."
   },
   unstructured_to_structured: {
     config: { output_schema: { type: "object", properties: { entities: { type: "array", items: { type: "string" } }, summary: { type: "string" } }, required: ["entities", "summary"] }, strict_json: true },
@@ -153,6 +172,9 @@ const AGENT_TEMPLATES: Record<string, any> = {
   }
 };
 
+const getAgentTypeLabel = (agentType: string): string =>
+  AGENT_TYPES.find(type => type.id === agentType)?.name || agentType;
+
 export default function Agents() {
   type AgentFormState = {
     name: string;
@@ -168,10 +190,11 @@ export default function Agents() {
   };
 
   const buildDefaultAgentState = (): AgentFormState => {
-    const template = AGENT_TEMPLATES['custom'];
+    const defaultType = 'custom';
+    const template = AGENT_TEMPLATES[defaultType];
     return {
-      name: '',
-      agent_type: 'custom',
+      name: getAgentTypeLabel(defaultType),
+      agent_type: defaultType,
       role: template.role || '',
       objectives: template.objectives || '',
       persona: template.persona || '',
@@ -284,6 +307,9 @@ export default function Agents() {
     setNewAgent(prev => ({
       ...prev,
       agent_type: type,
+      name: (!isEditing && (!prev.name.trim() || prev.name === getAgentTypeLabel(prev.agent_type) || prev.name === prev.agent_type))
+        ? getAgentTypeLabel(type)
+        : prev.name,
       role: template.role || '',
       objectives: template.objectives || '',
       persona: template.persona || '',
