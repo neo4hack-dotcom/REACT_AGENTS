@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Bot, Plus, Trash2, Database, Settings, Pencil } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Bot, Plus, Trash2, Database, Settings, Pencil, Download, Upload } from 'lucide-react';
 
 const AGENT_TYPES = [
   { id: 'custom', name: 'Custom Agent' },
@@ -230,6 +230,7 @@ export default function Agents() {
   const [isCreating, setIsCreating] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
   const [newAgent, setNewAgent] = useState<AgentFormState>(buildDefaultAgentState());
+  const importFileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     fetchAgents();
@@ -317,6 +318,80 @@ export default function Agents() {
     }
   };
 
+  const exportAgentsConfig = async () => {
+    try {
+      const res = await fetch('/api/agents/export');
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+
+      const payload = await res.json();
+      const fileContent = JSON.stringify(payload, null, 2);
+      const blob = new Blob([fileContent], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = url;
+      link.download = `agents-export-${timestamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      alert(`Failed to export agents: ${e.message}`);
+    }
+  };
+
+  const openImportDialog = () => {
+    importFileInputRef.current?.click();
+  };
+
+  const importAgentsConfig = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      let parsed = JSON.parse(text);
+
+      if (Array.isArray(parsed)) {
+        parsed = { agents: parsed };
+      }
+
+      if (!Array.isArray(parsed?.agents)) {
+        alert('Invalid import file: missing agents array.');
+        return;
+      }
+
+      const confirmed = window.confirm(
+        'This import will replace current agents and reset existing chat threads. Continue?'
+      );
+      if (!confirmed) return;
+
+      const res = await fetch('/api/agents/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+
+      const result = await res.json();
+      closeForm();
+      await Promise.all([fetchAgents(), fetchDbConfigs()]);
+      alert(
+        `Import completed. Agents imported: ${result.agents_imported ?? 0}.` +
+        (typeof result.db_configs_imported === 'number' ? ` DB configs imported: ${result.db_configs_imported}.` : '')
+      );
+    } catch (e: any) {
+      alert(`Failed to import agents: ${e.message}`);
+    } finally {
+      event.target.value = '';
+    }
+  };
+
   const saveAgent = async (e: React.FormEvent) => {
     e.preventDefault();
     let parsedConfig = {};
@@ -380,13 +455,38 @@ export default function Agents() {
     <div className="p-8 max-w-6xl mx-auto space-y-8">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold text-white">AI Agents</h1>
-        <button
-          onClick={openCreateForm}
-          className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2.5 rounded-xl font-medium transition-colors"
-        >
-          <Plus className="w-5 h-5" />
-          New Agent
-        </button>
+        <div className="flex items-center gap-2">
+          <input
+            ref={importFileInputRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={importAgentsConfig}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={exportAgentsConfig}
+            className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-4 py-2.5 rounded-xl font-medium transition-colors"
+          >
+            <Download className="w-4 h-4" />
+            Export
+          </button>
+          <button
+            type="button"
+            onClick={openImportDialog}
+            className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-4 py-2.5 rounded-xl font-medium transition-colors"
+          >
+            <Upload className="w-4 h-4" />
+            Import
+          </button>
+          <button
+            onClick={openCreateForm}
+            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-5 py-2.5 rounded-xl font-medium transition-colors"
+          >
+            <Plus className="w-5 h-5" />
+            New Agent
+          </button>
+        </div>
       </div>
 
       {isCreating && (

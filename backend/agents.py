@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, List, TypedDict
 
 import feedparser
@@ -56,6 +57,144 @@ def _coerce_message_content(content: Any) -> str:
 def _extract_json_block(text: str) -> str:
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     return match.group(1) if match else text
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_identifier(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _agent_catalog_entry(agent: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": agent.get("id"),
+        "name": agent.get("name"),
+        "agent_type": agent.get("agent_type"),
+        "role": agent.get("role"),
+        "objectives": agent.get("objectives"),
+    }
+
+
+def _agent_aliases(agent: Dict[str, Any]) -> List[str]:
+    aliases: List[str] = []
+    name = str(agent.get("name") or "").strip()
+    agent_type = str(agent.get("agent_type") or "").strip()
+    role = str(agent.get("role") or "").strip()
+
+    if name:
+        aliases.append(name)
+    if agent_type:
+        aliases.append(agent_type)
+        aliases.append(agent_type.replace("_", " "))
+    if role:
+        aliases.append(role)
+
+    # Keep insertion order while removing duplicates.
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        key = alias.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(alias)
+    return deduped
+
+
+def _best_fuzzy_agent_match(query: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    norm_query = _normalize_identifier(query)
+    if len(norm_query) < 4:
+        return None
+
+    scored: List[tuple[float, Dict[str, Any]]] = []
+    for agent in candidates:
+        best_for_agent = 0.0
+        for alias in _agent_aliases(agent):
+            norm_alias = _normalize_identifier(alias)
+            if not norm_alias:
+                continue
+            score = SequenceMatcher(None, norm_query, norm_alias).ratio()
+            if score > best_for_agent:
+                best_for_agent = score
+        if best_for_agent > 0:
+            scored.append((best_for_agent, agent))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_agent = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+
+    # Require a strong match. If two candidates are too close, avoid random routing.
+    if best_score < 0.84:
+        return None
+    if (best_score - second_score) < 0.06 and best_score < 0.96:
+        return None
+    return best_agent
+
+
+def _resolve_agent_from_call(call: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not candidates:
+        return None
+
+    requested_id = _safe_int(call.get("agent_id"))
+    if requested_id is not None:
+        direct = next((agent for agent in candidates if _safe_int(agent.get("id")) == requested_id), None)
+        if direct:
+            return direct
+
+    requested_name = str(call.get("agent_name") or call.get("agent") or "").strip()
+    requested_type = str(call.get("agent_type") or "").strip()
+
+    if requested_name:
+        normalized_name = _normalize_identifier(requested_name)
+
+        # First, strong deterministic matches on aliases (name/type/role).
+        for agent in candidates:
+            aliases = _agent_aliases(agent)
+            for alias in aliases:
+                if alias.lower() == requested_name.lower():
+                    return agent
+                if normalized_name and _normalize_identifier(alias) == normalized_name:
+                    return agent
+
+        # Then, relaxed containment on normalized aliases.
+        if normalized_name:
+            for agent in candidates:
+                for alias in _agent_aliases(agent):
+                    normalized_alias = _normalize_identifier(alias)
+                    if not normalized_alias:
+                        continue
+                    if normalized_name in normalized_alias or normalized_alias in normalized_name:
+                        return agent
+
+        fuzzy_name_match = _best_fuzzy_agent_match(requested_name, candidates)
+        if fuzzy_name_match:
+            return fuzzy_name_match
+
+    if requested_type:
+        normalized_type = _normalize_identifier(requested_type)
+        for agent in candidates:
+            agent_type = str(agent.get("agent_type") or "").strip()
+            if agent_type.lower() == requested_type.lower():
+                return agent
+            if normalized_type and _normalize_identifier(agent_type) == normalized_type:
+                return agent
+
+        fuzzy_type_match = _best_fuzzy_agent_match(requested_type, candidates)
+        if fuzzy_type_match:
+            return fuzzy_type_match
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
 
 
 def build_agent_execution_config(agent: Dict[str, Any]) -> Dict[str, Any]:
@@ -564,6 +703,8 @@ class ManagerState(TypedDict):
     conversation_history: str
     scratchpad: Dict[str, Any]
     current_step: int
+    agent_calls_count: int
+    max_agent_calls: int
     max_steps: int
     done: bool
     final_answer: str
@@ -579,7 +720,7 @@ class MultiAgentManager:
         on_step: Callable[[Dict[str, Any]], None] | None = None,
     ) -> Dict[str, Any]:
         cfg = manager_config or {}
-        active_agents = [agent for agent in agents if agent.get("agent_type") != "web_navigator"]
+        active_agents = [agent for agent in agents if agent.get("agent_type") != "manager"]
 
         state: ManagerState = {
             "input": user_input,
@@ -590,6 +731,8 @@ class MultiAgentManager:
             "conversation_history": f"User Request: {user_input}\n",
             "scratchpad": {},
             "current_step": 0,
+            "agent_calls_count": 0,
+            "max_agent_calls": int(cfg.get("max_agent_calls") or 20),
             "max_steps": int(cfg.get("max_steps") or 10),
             "done": False,
             "final_answer": "",
@@ -605,12 +748,25 @@ class MultiAgentManager:
                 "status": "manager_start",
                 "message": "Starting multi-agent orchestration",
                 "active_agents": len(active_agents),
-                "unavailable_agents": len(agents) - len(active_agents),
+                "max_steps": state["max_steps"],
+                "max_agent_calls": state["max_agent_calls"],
             }
         )
 
         async def iterate(current_state: ManagerState) -> ManagerState:
             if current_state["done"]:
+                return current_state
+
+            if len(current_state["active_agents"]) == 0:
+                current_state["final_answer"] = "No specialized agents are configured. Create at least one non-manager agent."
+                add_step(
+                    {
+                        "status": "manager_final",
+                        "answer": current_state["final_answer"],
+                        "manager_summary": "No available worker agents.",
+                    }
+                )
+                current_state["done"] = True
                 return current_state
 
             if current_state["current_step"] >= current_state["max_steps"]:
@@ -625,9 +781,17 @@ class MultiAgentManager:
                 current_state["done"] = True
                 return current_state
 
+            agent_catalog = [_agent_catalog_entry(agent) for agent in current_state["active_agents"]]
             manager_prompt = f"""You are an advanced Multi-Agent Orchestrator.
-Available agents:
-{chr(10).join([f"- {a.get('name')} ({a.get('agent_type')}): {a.get('role') or ''} - {a.get('objectives') or ''}" for a in current_state['active_agents']])}
+Available agents catalog (always use agent_id when possible):
+{json.dumps(agent_catalog, ensure_ascii=False, indent=2)}
+
+Execution budget:
+- max_steps: {current_state["max_steps"]}
+- current_step: {current_state["current_step"]}
+- max_agent_calls: {current_state["max_agent_calls"]}
+- agent_calls_used: {current_state["agent_calls_count"]}
+- agent_calls_remaining: {max(current_state["max_agent_calls"] - current_state["agent_calls_count"], 0)}
 
 Current Conversation History & Knowledge:
 {current_state['conversation_history']}
@@ -641,10 +805,11 @@ CRITICAL INSTRUCTIONS FOR LARGE DATA/SCHEMAS:
    - Phase 2 (Inspection): Query specific column definitions, data types, or file samples.
    - Phase 3 (Execution): Run the targeted SQL or data extraction.
    - Phase 4 (Synthesis): Analyze and format the final result.
-2. At EVERY step, re-evaluate your plan based on the new knowledge acquired. Optimize the next calls.
-3. You can call multiple agents in parallel if needed (Map-Reduce).
-4. Do NOT send the entire conversation history to agents. Extract ONLY the relevant context (e.g., specific table names, specific metrics) and pass it in the "input" field for that agent.
-5. You can update the "scratchpad" to store variables (like schema definitions) for future steps.
+2. At EVERY step, re-evaluate your plan based on the new knowledge acquired. Optimize the next calls and avoid redundant repeated calls.
+3. You can call multiple agents in parallel if needed (Map-Reduce), but stay within budget.
+4. Do NOT send the entire conversation history to agents. Extract ONLY the relevant context and pass it in the "input" field.
+5. You can update the "scratchpad" to store variables (schema, metrics, intermediate findings).
+6. If you have enough information, return "final_answer" immediately.
 
 Decide the next step. Return ONLY a valid JSON object with the following structure:
 {{
@@ -652,7 +817,7 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
   "current_plan": "Your updated step-by-step plan based on current knowledge",
   "rationale": "Why you are making this decision and how it optimizes the plan",
   "scratchpad_updates": {{ "key": "value" }},
-  "calls": [{{"agent_name": "exact name of agent", "input": "highly detailed instruction, filtered to ONLY include necessary context"}}],
+  "calls": [{{"agent_id": 1, "agent_name": "optional fallback", "agent_type": "optional", "input": "highly detailed instruction with only required context"}}],
   "final_answer": "The comprehensive final answer to the user",
   "missing_information": "Any info you still need to proceed"
 }}"""
@@ -691,61 +856,129 @@ Decide the next step. Return ONLY a valid JSON object with the following structu
                     and isinstance(decision.get("calls"), list)
                     and len(decision["calls"]) > 0
                 ):
-                    async def execute_call(call: Dict[str, Any]) -> str:
-                        agent_name = call.get("agent_name")
-                        call_input = call.get("input") or ""
-                        selected = next(
-                            (agent for agent in current_state["active_agents"] if agent.get("name") == agent_name),
-                            None,
-                        )
-
-                        if not selected:
-                            add_step({"status": "agent_not_found", "agent": agent_name})
-                            return (
-                                f"\nAttempted to call agent {agent_name} "
-                                "but it was not found or unavailable.\n"
-                            )
-
+                    remaining_agent_calls = current_state["max_agent_calls"] - current_state["agent_calls_count"]
+                    if remaining_agent_calls <= 0:
+                        current_state["final_answer"] = "Reached max agent-call budget. Provide a final answer from gathered evidence."
                         add_step(
                             {
-                                "status": "agent_call_started",
-                                "agent": selected.get("name"),
-                                "input": call_input,
+                                "status": "manager_final",
+                                "answer": current_state["final_answer"],
+                                "manager_summary": "Max agent-call budget reached.",
                             }
                         )
+                        current_state["done"] = True
+                    else:
+                        raw_calls = [call for call in decision["calls"] if isinstance(call, dict)]
+                        bounded_calls = raw_calls[:remaining_agent_calls]
 
-                        try:
-                            execution_config = build_agent_execution_config(selected)
-                            result = await AgentExecutor.execute(
-                                selected.get("agent_type") or "custom",
-                                execution_config,
-                                call_input,
-                                current_state["llm"],
-                                on_step=add_step,
-                                agent_name=selected.get("name") or selected.get("agent_type") or "agent",
+                        unique_calls: List[Dict[str, Any]] = []
+                        seen_signatures: set[str] = set()
+                        for call in bounded_calls:
+                            signature = "|".join(
+                                [
+                                    str(call.get("agent_id") or ""),
+                                    _normalize_identifier(call.get("agent_name") or call.get("agent") or call.get("agent_type")),
+                                    str(call.get("input") or "").strip(),
+                                ]
                             )
+                            if signature in seen_signatures:
+                                continue
+                            seen_signatures.add(signature)
+                            unique_calls.append(call)
+
+                        resolved_calls: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+                        for call in unique_calls:
+                            selected = _resolve_agent_from_call(call, current_state["active_agents"])
+                            if selected is None:
+                                add_step(
+                                    {
+                                        "status": "agent_not_found",
+                                        "requested_call": call,
+                                        "available_agents": [
+                                            {
+                                                "id": agent.get("id"),
+                                                "name": agent.get("name"),
+                                                "agent_type": agent.get("agent_type"),
+                                            }
+                                            for agent in current_state["active_agents"]
+                                        ],
+                                    }
+                                )
+                                continue
+                            resolved_calls.append((call, selected))
+
+                        if len(resolved_calls) == 0:
                             add_step(
                                 {
-                                    "status": "agent_call_completed",
-                                    "agent": selected.get("name"),
-                                    "result": result,
+                                    "status": "manager_no_valid_calls",
+                                    "message": "Manager requested calls, but none matched existing agents.",
                                 }
                             )
-                            if result.get("sql"):
-                                add_step({"status": "sql_generated", "sql": result["sql"]})
-                            return f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n"
-                        except Exception as exc:
+                        else:
+                            current_state["agent_calls_count"] += len(resolved_calls)
                             add_step(
                                 {
-                                    "status": "agent_call_failed",
-                                    "agent": selected.get("name"),
-                                    "error": str(exc),
+                                    "status": "manager_dispatch",
+                                    "calls_dispatched": len(resolved_calls),
+                                    "agent_calls_used": current_state["agent_calls_count"],
+                                    "agent_calls_remaining": max(
+                                        current_state["max_agent_calls"] - current_state["agent_calls_count"],
+                                        0,
+                                    ),
                                 }
                             )
-                            return f"\nAgent {selected.get('name')} failed: {exc}\n"
 
-                    results = await asyncio.gather(*(execute_call(call) for call in decision["calls"]))
-                    current_state["conversation_history"] += "".join(results)
+                            async def execute_call(call: Dict[str, Any], selected: Dict[str, Any]) -> str:
+                                call_input = str(call.get("input") or "").strip()
+                                if not call_input:
+                                    call_input = str(current_state["input"])
+
+                                add_step(
+                                    {
+                                        "status": "agent_call_started",
+                                        "agent": selected.get("name"),
+                                        "agent_id": selected.get("id"),
+                                        "agent_type": selected.get("agent_type"),
+                                        "input": call_input,
+                                    }
+                                )
+
+                                try:
+                                    execution_config = build_agent_execution_config(selected)
+                                    result = await AgentExecutor.execute(
+                                        selected.get("agent_type") or "custom",
+                                        execution_config,
+                                        call_input,
+                                        current_state["llm"],
+                                        on_step=add_step,
+                                        agent_name=selected.get("name") or selected.get("agent_type") or "agent",
+                                    )
+                                    add_step(
+                                        {
+                                            "status": "agent_call_completed",
+                                            "agent": selected.get("name"),
+                                            "agent_id": selected.get("id"),
+                                            "result": result,
+                                        }
+                                    )
+                                    if result.get("sql"):
+                                        add_step({"status": "sql_generated", "sql": result["sql"]})
+                                    return f"\nAgent {selected.get('name')} responded: {result.get('answer')}\n"
+                                except Exception as exc:
+                                    add_step(
+                                        {
+                                            "status": "agent_call_failed",
+                                            "agent": selected.get("name"),
+                                            "agent_id": selected.get("id"),
+                                            "error": str(exc),
+                                        }
+                                    )
+                                    return f"\nAgent {selected.get('name')} failed: {exc}\n"
+
+                            results = await asyncio.gather(
+                                *(execute_call(call, selected) for call, selected in resolved_calls)
+                            )
+                            current_state["conversation_history"] += "".join(results)
                 else:
                     current_state["conversation_history"] += f"\nManager thought: {rationale}\n"
 

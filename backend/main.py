@@ -182,6 +182,47 @@ def build_agent_record(payload: Dict[str, Any], agent_id: int) -> Dict[str, Any]
     }
 
 
+def build_db_config_record(payload: Dict[str, Any], config_id: int) -> Dict[str, Any]:
+    return {
+        "id": config_id,
+        "type": payload.get("type") or "clickhouse",
+        "host": payload.get("host") or "",
+        "port": int(payload.get("port") or 0),
+        "username": payload.get("username") or "",
+        "password": payload.get("password") or "",
+        "database_name": payload.get("database_name") or "",
+    }
+
+
+def _deserialize_agent_config(raw_config: Any) -> Any:
+    if isinstance(raw_config, dict):
+        return raw_config
+    if isinstance(raw_config, str) and raw_config.strip():
+        try:
+            parsed = json.loads(raw_config)
+            if isinstance(parsed, (dict, list, str, int, float, bool)) or parsed is None:
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def serialize_agent_export(agent_row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": agent_row.get("id"),
+        "name": agent_row.get("name"),
+        "role": agent_row.get("role"),
+        "objectives": agent_row.get("objectives"),
+        "persona": agent_row.get("persona"),
+        "tools": agent_row.get("tools"),
+        "memory_settings": agent_row.get("memory_settings"),
+        "system_prompt": agent_row.get("system_prompt") or "",
+        "db_config_id": agent_row.get("db_config_id"),
+        "agent_type": agent_row.get("agent_type") or "custom",
+        "config": _deserialize_agent_config(agent_row.get("config")),
+    }
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -371,17 +412,7 @@ async def create_db_config(request: Request) -> JSONResponse:
     try:
         def mutate(state: Dict[str, Any]) -> None:
             config_id = _next_id(state, "next_db_config_id")
-            state["db_config"].append(
-                {
-                    "id": config_id,
-                    "type": payload.get("type") or "clickhouse",
-                    "host": payload.get("host") or "",
-                    "port": int(payload.get("port") or 0),
-                    "username": payload.get("username") or "",
-                    "password": payload.get("password") or "",
-                    "database_name": payload.get("database_name") or "",
-                }
-            )
+            state["db_config"].append(build_db_config_record(payload, config_id))
 
         store.mutate(mutate)
         return JSONResponse(content={"success": True})
@@ -416,6 +447,91 @@ async def test_db_config(request: Request) -> JSONResponse:
 async def get_agents() -> JSONResponse:
     state = store.read()
     return JSONResponse(content=state["agents"])
+
+
+@app.get("/api/agents/export")
+async def export_agents() -> JSONResponse:
+    state = store.read()
+    payload = {
+        "format": "react_agents_export_v1",
+        "exported_at": _now_iso(),
+        "db_config": state.get("db_config", []),
+        "agents": [serialize_agent_export(agent) for agent in state.get("agents", [])],
+    }
+    return JSONResponse(content=payload)
+
+
+@app.post("/api/agents/import")
+async def import_agents(request: Request) -> JSONResponse:
+    payload = await request.json()
+    imported_agents = payload.get("agents")
+    imported_db_configs = payload.get("db_config")
+
+    if not isinstance(imported_agents, list):
+        return JSONResponse(status_code=400, content={"error": "Invalid payload: agents must be an array"})
+
+    try:
+        def mutate(state: Dict[str, Any]) -> Dict[str, int]:
+            db_id_map: Dict[int, int] = {}
+
+            if isinstance(imported_db_configs, list):
+                state["db_config"] = []
+                for db_item in imported_db_configs:
+                    if not isinstance(db_item, dict):
+                        continue
+                    config_id = _next_id(state, "next_db_config_id")
+                    old_id = _safe_int(db_item.get("id"))
+                    if old_id is not None:
+                        db_id_map[old_id] = config_id
+                    state["db_config"].append(build_db_config_record(db_item, config_id))
+
+            existing_db_ids = {int(item.get("id", 0)) for item in state.get("db_config", [])}
+
+            state["agents"] = []
+            state["chat_threads"] = []
+
+            imported_count = 0
+            for item in imported_agents:
+                if not isinstance(item, dict):
+                    continue
+
+                raw_db_id = _safe_int(item.get("db_config_id"))
+                if raw_db_id is None:
+                    mapped_db_id = None
+                elif raw_db_id in db_id_map:
+                    mapped_db_id = db_id_map[raw_db_id]
+                elif raw_db_id in existing_db_ids:
+                    mapped_db_id = raw_db_id
+                else:
+                    mapped_db_id = None
+
+                agent_payload = {
+                    "name": item.get("name"),
+                    "role": item.get("role"),
+                    "objectives": item.get("objectives"),
+                    "persona": item.get("persona"),
+                    "tools": item.get("tools"),
+                    "memory_settings": item.get("memory_settings"),
+                    "system_prompt": item.get("system_prompt") or "",
+                    "db_config_id": mapped_db_id,
+                    "agent_type": item.get("agent_type") or "custom",
+                    "config": _deserialize_agent_config(item.get("config")),
+                }
+
+                agent_id = _next_id(state, "next_agent_id")
+                state["agents"].append(build_agent_record(agent_payload, agent_id))
+                imported_count += 1
+
+            return {
+                "agents_imported": imported_count,
+                "db_configs_imported": len(state.get("db_config", [])) if isinstance(imported_db_configs, list) else 0,
+                "threads_reset": 1,
+            }
+
+        result = store.mutate(mutate)
+        return JSONResponse(content={"success": True, **result})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 @app.post("/api/agents")

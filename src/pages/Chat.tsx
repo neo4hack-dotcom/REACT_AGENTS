@@ -3,6 +3,7 @@ import { Send, Bot, User, Loader2, ChevronDown, ChevronUp, Plus, MessageSquare }
 import Markdown from 'react-markdown';
 
 type ChatMessage = {
+  local_id: string;
   role: 'user' | 'assistant';
   content: string;
   details?: any;
@@ -40,7 +41,7 @@ export default function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [activeAssistantMessageIndex, setActiveAssistantMessageIndex] = useState<number | null>(null);
+  const [activeAssistantMessageId, setActiveAssistantMessageId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -81,12 +82,17 @@ export default function Chat() {
     return role === 'user' ? 'user' : 'assistant';
   };
 
+  const createLocalMessageId = (prefix: string): string => {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  };
+
   const mapStoredMessages = (threadMessages: any[] | undefined): ChatMessage[] => {
     if (!Array.isArray(threadMessages)) return [];
-    return threadMessages.map((msg: any) => {
+    return threadMessages.map((msg: any, index: number) => {
       const details = msg?.details;
       const steps = Array.isArray(details?.steps) ? details.steps : undefined;
       return {
+        local_id: String(msg?.local_id || `stored-${msg?.created_at || 'na'}-${index}`),
         role: normalizeRole(String(msg?.role || 'assistant')),
         content: String(msg?.content || ''),
         details,
@@ -251,16 +257,23 @@ export default function Chat() {
     }
   };
 
-  const toggleDetails = (messageIndex: number) => {
+  const toggleDetails = (messageId: string) => {
     setMessages(prev => {
-      const next = [...prev];
-      if (!next[messageIndex]) return next;
-      next[messageIndex] = {
-        ...next[messageIndex],
-        showDetails: !next[messageIndex].showDetails,
-      };
-      return next;
+      return prev.map(message => (
+        message.local_id === messageId
+          ? { ...message, showDetails: !message.showDetails }
+          : message
+      ));
     });
+  };
+
+  const summarizeLiveStep = (step: any): string => {
+    const message = String(step?.message || '').trim();
+    if (message) return message;
+    const rationale = String(step?.rationale || '').trim();
+    if (rationale) return rationale;
+    const status = String(step?.status || 'thinking').replace(/_/g, ' ');
+    return `Execution: ${status}`;
   };
 
   const deriveFallbackAnswerFromSteps = (steps: any[] | undefined): string => {
@@ -301,13 +314,14 @@ export default function Chat() {
       }
     }
 
-    const newMessageIndex = messages.length + 1;
+    const userMessageId = createLocalMessageId('user');
+    const assistantMessageId = createLocalMessageId('assistant');
     setMessages(prev => [
       ...prev,
-      { role: 'user', content: userMsg },
-      { role: 'assistant', content: '', steps: [], showDetails: false },
+      { local_id: userMessageId, role: 'user', content: userMsg },
+      { local_id: assistantMessageId, role: 'assistant', content: 'Preparing execution...', steps: [], showDetails: true },
     ]);
-    setActiveAssistantMessageIndex(newMessageIndex);
+    setActiveAssistantMessageId(assistantMessageId);
     setIsLoading(true);
 
     try {
@@ -320,9 +334,11 @@ export default function Chat() {
       if (!res.ok) {
         const errorMessage = await readErrorMessage(res);
         setMessages(prev => {
-          const next = [...prev];
-          next[newMessageIndex] = { role: 'assistant', content: `Error: ${errorMessage}` };
-          return next;
+          return prev.map(message => (
+            message.local_id === assistantMessageId
+              ? { ...message, content: `Error: ${errorMessage}` }
+              : message
+          ));
         });
         return;
       }
@@ -338,16 +354,16 @@ export default function Chat() {
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-          const events = buffer.split('\n\n');
+          const events = buffer.split(/\r?\n\r?\n/);
           buffer = events.pop() || '';
 
           for (const rawEvent of events) {
-            const lines = rawEvent.split('\n').filter(line => line.trim() !== '');
+            const lines = rawEvent.split(/\r?\n/).filter(line => line.trim() !== '');
             for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
+              if (!line.startsWith('data:')) continue;
 
               try {
-                const data = JSON.parse(line.slice(6));
+                const data = JSON.parse(line.slice(5).trimStart());
 
                 if (typeof data.threadId === 'number') {
                   responseThreadId = data.threadId;
@@ -355,10 +371,17 @@ export default function Chat() {
 
                 setMessages(prev => {
                   const next = [...prev];
-                  const current = { ...next[newMessageIndex] };
+                  const targetIndex = next.findIndex(message => message.local_id === assistantMessageId);
+                  if (targetIndex < 0) return next;
+
+                  const current = { ...next[targetIndex] };
 
                   if (data.type === 'step') {
                     current.steps = [...(current.steps || []), data.step];
+                    current.showDetails = true;
+                    if (!current.content || current.content.startsWith('Preparing execution') || current.content.startsWith('Execution:')) {
+                      current.content = summarizeLiveStep(data.step);
+                    }
                   } else if (data.type === 'result') {
                     const fallbackFromSteps = deriveFallbackAnswerFromSteps(data.steps);
                     current.content = data.response || fallbackFromSteps || current.content || 'Le manager a terminé sans réponse finale explicite.';
@@ -370,7 +393,7 @@ export default function Chat() {
                     current.content = `Error: ${data.error}`;
                   }
 
-                  next[newMessageIndex] = current;
+                  next[targetIndex] = current;
                   return next;
                 });
               } catch (parseErr) {
@@ -387,13 +410,15 @@ export default function Chat() {
       await refreshThreads(responseThreadId);
     } catch (e: any) {
       setMessages(prev => {
-        const next = [...prev];
-        next[newMessageIndex] = { role: 'assistant', content: `Error: ${e.message}` };
-        return next;
+        return prev.map(message => (
+          message.local_id === assistantMessageId
+            ? { ...message, content: `Error: ${e.message}` }
+            : message
+        ));
       });
     } finally {
       setIsLoading(false);
-      setActiveAssistantMessageIndex(null);
+      setActiveAssistantMessageId(null);
     }
   };
 
@@ -476,8 +501,8 @@ export default function Chat() {
               <p>Select a discussion or start a new one.</p>
             </div>
           ) : (
-            messages.map((msg, idx) => (
-              <div key={idx} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            messages.map(msg => (
+              <div key={msg.local_id} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {msg.role === 'assistant' && (
                   <div className="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-500 flex items-center justify-center flex-shrink-0">
                     <Bot className="w-5 h-5" />
@@ -493,7 +518,7 @@ export default function Chat() {
                     <div className="mb-3 flex justify-end">
                       <button
                         type="button"
-                        onClick={() => toggleDetails(idx)}
+                        onClick={() => toggleDetails(msg.local_id)}
                         className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900/60 px-2 py-1 text-xs text-zinc-300 hover:text-white hover:border-zinc-500 transition-colors"
                       >
                         {msg.showDetails ? 'Hide details' : 'Détail'}
@@ -566,21 +591,21 @@ export default function Chat() {
                 <Loader2 className="w-4 h-4 animate-spin text-emerald-500" />
                 <span className="text-sm text-zinc-400">Agent is thinking...</span>
                 <button
-                  type="button"
-                  onClick={() => {
-                    if (activeAssistantMessageIndex !== null) {
-                      toggleDetails(activeAssistantMessageIndex);
-                    }
-                  }}
-                  disabled={activeAssistantMessageIndex === null}
-                  className="ml-2 inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900/60 px-2 py-1 text-xs text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  {activeAssistantMessageIndex !== null && messages[activeAssistantMessageIndex]?.showDetails ? 'Masquer détail' : 'Détail'}
-                  {activeAssistantMessageIndex !== null && messages[activeAssistantMessageIndex]?.showDetails ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                </button>
-              </div>
+                type="button"
+                onClick={() => {
+                  if (activeAssistantMessageId) {
+                    toggleDetails(activeAssistantMessageId);
+                  }
+                }}
+                disabled={!activeAssistantMessageId}
+                className="ml-2 inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900/60 px-2 py-1 text-xs text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {activeAssistantMessageId && messages.find(m => m.local_id === activeAssistantMessageId)?.showDetails ? 'Masquer détail' : 'Détail'}
+                {activeAssistantMessageId && messages.find(m => m.local_id === activeAssistantMessageId)?.showDetails ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+              </button>
             </div>
-          )}
+          </div>
+        )}
           <div ref={messagesEndRef} />
         </div>
 

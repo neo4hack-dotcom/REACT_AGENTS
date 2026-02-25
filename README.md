@@ -61,7 +61,24 @@ Les agents disponibles dans l'interface (type + description):
 - Git (optionnel mais recommandé)
 - Optionnel: Ollama si vous utilisez le provider local (`ollama`)
 
-### 2) Ouvrir un terminal dans le projet
+### 2) Quick Start (1 commande, recommandé)
+
+Depuis la racine du projet:
+
+```powershell
+npm run quickstart
+```
+
+Cette commande:
+
+- installe les dépendances frontend (`npm install`)
+- crée `.venv` Python si nécessaire
+- installe les dépendances backend (`backend/requirements.txt`)
+- lance automatiquement le backend (`http://localhost:3000`) et l'UI (`http://localhost:5173`)
+
+Pour arrêter: `Ctrl + C`.
+
+### 3) Ouvrir un terminal dans le projet
 
 PowerShell:
 
@@ -69,7 +86,7 @@ PowerShell:
 cd C:\chemin\vers\CODEX_AGENTS
 ```
 
-### 3) Créer et activer un environnement Python
+### 4) Créer et activer un environnement Python
 
 PowerShell:
 
@@ -91,7 +108,7 @@ Si PowerShell bloque l'activation:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-### 4) Installer les dépendances
+### 5) Installer les dépendances
 
 ```powershell
 python -m pip install --upgrade pip
@@ -99,7 +116,7 @@ python -m pip install -r backend/requirements.txt
 npm install
 ```
 
-### 5) Démarrer l'application
+### 6) Démarrer l'application
 
 ```powershell
 npm run dev
@@ -110,7 +127,7 @@ L'application sera disponible sur:
 - Frontend: `http://localhost:5173`
 - API backend: `http://localhost:3000`
 
-### 6) Vérifier que tout fonctionne
+### 7) Vérifier que tout fonctionne
 
 ```powershell
 npm run lint
@@ -129,6 +146,7 @@ npm run build
 
 ## Scripts utiles
 
+- `npm run quickstart`: installation + lancement backend/frontend en une seule commande
 - `npm run dev`: lance backend Python + frontend Vite
 - `npm run dev:backend`: lance uniquement FastAPI
 - `npm run dev:frontend`: lance uniquement Vite
