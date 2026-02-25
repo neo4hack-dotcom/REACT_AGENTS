@@ -147,6 +147,7 @@ store = JsonStore(DB_JSON_PATH)
 app = FastAPI(title="AI Data Agents Backend", version="2.2.0")
 chat_runs_lock = RLock()
 chat_runs: Dict[str, Dict[str, Any]] = {}
+chat_run_tasks: Dict[str, asyncio.Task[Any]] = {}
 
 
 def _cleanup_chat_runs_unlocked(now_ts: float | None = None) -> None:
@@ -155,11 +156,12 @@ def _cleanup_chat_runs_unlocked(now_ts: float | None = None) -> None:
     for run_id, record in chat_runs.items():
         finished_ts = float(record.get("finished_ts") or 0)
         status = str(record.get("status") or "")
-        if status in {"completed", "failed"} and finished_ts > 0:
+        if status in {"completed", "failed", "cancelled"} and finished_ts > 0:
             if ts - finished_ts >= CHAT_RUN_RETENTION_SECONDS:
                 expired.append(run_id)
     for run_id in expired:
         chat_runs.pop(run_id, None)
+        chat_run_tasks.pop(run_id, None)
 
 
 def _create_chat_run(run_id: str, thread_id: int, agent_id: int, agent_name: str) -> Dict[str, Any]:
@@ -178,6 +180,8 @@ def _create_chat_run(run_id: str, thread_id: int, agent_id: int, agent_name: str
         "finished_ts": None,
         "response": None,
         "error": None,
+        "cancel_requested": False,
+        "cancel_reason": None,
         "steps": [],
     }
     with chat_runs_lock:
@@ -209,6 +213,9 @@ def _set_chat_run_finished(run_id: str, *, status: str, response: str | None = N
         record = chat_runs.get(run_id)
         if not record:
             return
+        current_status = str(record.get("status") or "")
+        if current_status in {"completed", "failed", "cancelled"}:
+            return
         record["status"] = status
         record["updated_at"] = now_iso
         record["finished_at"] = now_iso
@@ -228,6 +235,74 @@ def _get_chat_run(run_id: str) -> Optional[Dict[str, Any]]:
         if not record:
             return None
         return dict(record)
+
+
+def _is_run_active(run_id: str) -> bool:
+    with chat_runs_lock:
+        record = chat_runs.get(run_id)
+        if not record:
+            return False
+        if bool(record.get("cancel_requested")):
+            return False
+        return str(record.get("status") or "") == "running"
+
+
+def _get_run_cancel_reason(run_id: str) -> str:
+    with chat_runs_lock:
+        record = chat_runs.get(run_id)
+        if not record:
+            return "Cancelled by user"
+        reason = str(record.get("cancel_reason") or "").strip()
+        if reason:
+            return reason
+        error = str(record.get("error") or "").strip()
+        return error or "Cancelled by user"
+
+
+def _register_chat_run_task(run_id: str, task: asyncio.Task[Any]) -> None:
+    with chat_runs_lock:
+        chat_run_tasks[run_id] = task
+
+
+def _unregister_chat_run_task(run_id: str) -> None:
+    with chat_runs_lock:
+        chat_run_tasks.pop(run_id, None)
+
+
+def _request_chat_run_cancel(run_id: str, reason: str = "Cancelled by user") -> Optional[Dict[str, Any]]:
+    reason_text = reason.strip() or "Cancelled by user"
+    now_iso = _now_iso()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    with chat_runs_lock:
+        _cleanup_chat_runs_unlocked(now_ts)
+        record = chat_runs.get(run_id)
+        if not record:
+            return None
+
+        if str(record.get("status") or "") != "running":
+            snapshot = dict(record)
+            snapshot["_cancel_applied"] = False
+            return snapshot
+
+        record["cancel_requested"] = True
+        record["cancel_reason"] = reason_text
+        record["status"] = "cancelled"
+        record["updated_at"] = now_iso
+        record["finished_at"] = now_iso
+        record["finished_ts"] = now_ts
+        if not record.get("error"):
+            record["error"] = reason_text
+        snapshot = dict(record)
+        snapshot["_cancel_applied"] = True
+        return snapshot
+
+
+def _cancel_chat_run_task(run_id: str) -> None:
+    task: Optional[asyncio.Task[Any]] = None
+    with chat_runs_lock:
+        task = chat_run_tasks.get(run_id)
+    if task and not task.done():
+        task.cancel()
 
 
 def parse_agent_config(agent_row: Dict[str, Any]) -> Dict[str, Any]:
@@ -469,9 +544,30 @@ async def _execute_chat_run_background(
     agent_name: str,
 ) -> None:
     def add_step(step: Dict[str, Any]) -> None:
+        if not _is_run_active(run_id):
+            raise asyncio.CancelledError()
         _append_chat_run_step(run_id, step)
 
-    def persist_assistant(content: str, details: Any = None, clear_processing: bool = True) -> None:
+    def clear_processing_state() -> None:
+        def mutate(state_mut: Dict[str, Any]) -> None:
+            thread = _find_thread(state_mut, thread_id)
+            if not thread:
+                return
+            _set_thread_processing_state(
+                thread,
+                is_processing=False,
+                run_id=run_id,
+                clear_only_if_run_matches=True,
+            )
+
+        store.mutate(mutate)
+
+    def persist_assistant(content: str, details: Any = None, clear_processing: bool = True) -> bool:
+        if not _is_run_active(run_id):
+            if clear_processing:
+                clear_processing_state()
+            return False
+
         def mutate(state_mut: Dict[str, Any]) -> None:
             thread = _find_thread(state_mut, thread_id)
             if not thread:
@@ -486,8 +582,12 @@ async def _execute_chat_run_background(
                 )
 
         store.mutate(mutate)
+        return True
 
     try:
+        if not _is_run_active(run_id):
+            raise asyncio.CancelledError()
+
         if agent.get("agent_type") == "manager":
             state = store.read()
             all_agents = [a for a in state["agents"] if a.get("agent_type") != "manager"]
@@ -498,13 +598,15 @@ async def _execute_chat_run_background(
                 full_config,
                 on_step=add_step,
             )
+            if not _is_run_active(run_id):
+                raise asyncio.CancelledError()
             response_text = str(result.get("answer") or "")
             details = {
                 "steps": result.get("steps"),
                 "agent_type": "manager",
             }
-            persist_assistant(response_text, details)
-            _set_chat_run_finished(run_id, status="completed", response=response_text)
+            if persist_assistant(response_text, details):
+                _set_chat_run_finished(run_id, status="completed", response=response_text)
             return
 
         result = await AgentExecutor.execute(
@@ -515,13 +617,33 @@ async def _execute_chat_run_background(
             on_step=add_step,
             agent_name=agent_name,
         )
+        if not _is_run_active(run_id):
+            raise asyncio.CancelledError()
         response_text = str(result.get("answer") or "")
-        persist_assistant(response_text, result)
-        _set_chat_run_finished(run_id, status="completed", response=response_text)
+        if persist_assistant(response_text, result):
+            _set_chat_run_finished(run_id, status="completed", response=response_text)
+    except asyncio.CancelledError:
+        cancel_reason = _get_run_cancel_reason(run_id)
+        _append_chat_run_step(
+            run_id,
+            {
+                "status": "run_cancelled",
+                "message": cancel_reason,
+            },
+        )
+        clear_processing_state()
+        _set_chat_run_finished(run_id, status="cancelled", error=cancel_reason)
     except Exception as exc:
+        if not _is_run_active(run_id):
+            cancel_reason = _get_run_cancel_reason(run_id)
+            clear_processing_state()
+            _set_chat_run_finished(run_id, status="cancelled", error=cancel_reason)
+            return
         error_text = str(exc)
-        persist_assistant(f"Error: {error_text}", {"error": error_text})
-        _set_chat_run_finished(run_id, status="failed", error=error_text)
+        if persist_assistant(f"Error: {error_text}", {"error": error_text}):
+            _set_chat_run_finished(run_id, status="failed", error=error_text)
+    finally:
+        _unregister_chat_run_task(run_id)
 
 
 @app.get("/api/config/llm")
@@ -878,6 +1000,51 @@ async def get_chat_run(run_id: str) -> JSONResponse:
     return JSONResponse(content=run)
 
 
+@app.post("/api/chat/runs/{run_id}/cancel")
+async def cancel_chat_run(run_id: str) -> JSONResponse:
+    run = _request_chat_run_cancel(run_id)
+    if not run:
+        return JSONResponse(status_code=404, content={"error": "Run not found"})
+    cancel_applied = bool(run.pop("_cancel_applied", False))
+
+    thread_id = _safe_int(run.get("thread_id"))
+    if thread_id is not None:
+        def mutate(state_mut: Dict[str, Any]) -> None:
+            thread = _find_thread(state_mut, thread_id)
+            if not thread:
+                return
+            if cancel_applied:
+                _append_message(
+                    thread,
+                    "assistant",
+                    "Execution cancelled by user.",
+                    {"status": "cancelled", "run_id": run_id},
+                )
+            _set_thread_processing_state(
+                thread,
+                is_processing=False,
+                run_id=run_id,
+                clear_only_if_run_matches=True,
+            )
+
+        store.mutate(mutate)
+
+    if cancel_applied:
+        _append_chat_run_step(
+            run_id,
+            {
+                "status": "run_cancel_requested",
+                "message": "Cancellation requested by user",
+            },
+        )
+        _cancel_chat_run_task(run_id)
+
+    updated = _get_chat_run(run_id) or run
+    updated.pop("started_ts", None)
+    updated.pop("finished_ts", None)
+    return JSONResponse(content=updated)
+
+
 @app.post("/api/chat/{agent_id}/start")
 async def start_chat_agent(agent_id: int, request: Request) -> JSONResponse:
     payload = await request.json()
@@ -949,7 +1116,7 @@ async def start_chat_agent(agent_id: int, request: Request) -> JSONResponse:
         execution_input = f"{memory_context}\n\nCurrent user message:\n{message}" if memory_context else message
 
         _create_chat_run(run_id, resolved_thread_id, agent_id, agent_name)
-        asyncio.create_task(
+        task = asyncio.create_task(
             _execute_chat_run_background(
                 run_id=run_id,
                 thread_id=resolved_thread_id,
@@ -960,6 +1127,7 @@ async def start_chat_agent(agent_id: int, request: Request) -> JSONResponse:
                 agent_name=agent_name,
             )
         )
+        _register_chat_run_task(run_id, task)
 
         return JSONResponse(
             content={

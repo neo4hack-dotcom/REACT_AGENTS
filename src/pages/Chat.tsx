@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Bot, User, Loader2, ChevronDown, ChevronUp, Plus, MessageSquare, Trash2, RotateCcw, Activity } from 'lucide-react';
+import { Send, Bot, User, Loader2, ChevronDown, ChevronUp, Plus, MessageSquare, Trash2, RotateCcw, Activity, Square } from 'lucide-react';
 import Markdown from 'react-markdown';
 
 type ChatMessage = {
@@ -45,7 +45,7 @@ type ChatRunStatus = {
   thread_id: number;
   agent_id: number;
   agent_name?: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
   started_at?: string;
   updated_at?: string;
   finished_at?: string | null;
@@ -62,9 +62,13 @@ export default function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isStoppingRun, setIsStoppingRun] = useState(false);
+  const [isUserNearBottom, setIsUserNearBottom] = useState(true);
   const [activeAssistantMessageId, setActiveAssistantMessageId] = useState<string | null>(null);
   const [showLiveDetails, setShowLiveDetails] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
   const runPollRef = useRef<{ runId: string; threadId: number; messageId: string; cancelled: boolean } | null>(null);
   const selectedThreadIdRef = useRef<number | null>(null);
 
@@ -76,9 +80,38 @@ export default function Chat() {
     selectedThreadIdRef.current = selectedThreadId;
   }, [selectedThreadId]);
 
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    shouldAutoScrollRef.current = true;
+    setIsUserNearBottom(true);
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  };
+
+  const handleMessagesScroll = () => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const nearBottom = distanceToBottom <= 110;
+    shouldAutoScrollRef.current = nearBottom;
+    setIsUserNearBottom(nearBottom);
+  };
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (!shouldAutoScrollRef.current) return;
+    const behavior: ScrollBehavior = isLoading ? 'auto' : 'smooth';
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom(behavior);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, isLoading]);
+
+  useEffect(() => {
+    shouldAutoScrollRef.current = true;
+    setIsUserNearBottom(true);
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom('auto');
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedThreadId]);
 
   useEffect(() => {
     const hasProcessingThread = threads.some(thread => Boolean(thread.is_processing && thread.active_run_id));
@@ -542,6 +575,52 @@ export default function Chat() {
     }
   };
 
+  const stopActiveRun = async () => {
+    const runId = String(selectedThread?.active_run_id || runPollRef.current?.runId || '');
+    const threadId = selectedThread?.id || runPollRef.current?.threadId || selectedThreadIdRef.current;
+    if (!runId || !threadId || isStoppingRun) return;
+
+    const liveMessageId = runPollRef.current?.messageId || activeAssistantMessageId || `run-live-${runId}`;
+    setIsStoppingRun(true);
+
+    try {
+      const res = await fetch(`/api/chat/runs/${runId}/cancel`, { method: 'POST' });
+      if (!res.ok) {
+        throw new Error(await readErrorMessage(res));
+      }
+
+      let cancelledRun: ChatRunStatus | null = null;
+      try {
+        cancelledRun = await res.json();
+      } catch (_err) {
+        cancelledRun = null;
+      }
+
+      stopRunPolling();
+      setIsLoading(false);
+      setActiveAssistantMessageId(null);
+
+      if (cancelledRun && selectedThreadIdRef.current === threadId) {
+        upsertLiveRunMessage(cancelledRun, liveMessageId);
+      } else if (selectedThreadIdRef.current === threadId) {
+        setMessages(prev => prev.map(message => (
+          message.local_id === liveMessageId
+            ? { ...message, content: 'Execution cancelled by user.' }
+            : message
+        )));
+      }
+
+      await refreshThreads(threadId);
+      if (selectedThreadIdRef.current === threadId) {
+        await syncActiveThreadMessages(threadId);
+      }
+    } catch (e: any) {
+      alert(`Failed to stop agent: ${e.message}`);
+    } finally {
+      setIsStoppingRun(false);
+    }
+  };
+
   const upsertLiveRunMessage = (run: ChatRunStatus, messageId: string) => {
     setMessages(prev => {
       const next = [...prev];
@@ -566,7 +645,10 @@ export default function Chat() {
 
       const managerTrace = renderManagerLiveTrace(liveSteps);
 
-      if (run.status === 'failed') {
+      if (run.status === 'cancelled') {
+        const cancellationText = `Execution cancelled: ${run.error || 'Cancelled by user.'}`;
+        current.content = managerTrace ? `${managerTrace}\n\n${cancellationText}` : cancellationText;
+      } else if (run.status === 'failed') {
         current.content = `Error: ${run.error || 'Execution failed.'}`;
       } else if (run.status === 'completed') {
         current.content = String(run.response || deriveFallbackAnswerFromSteps(liveSteps) || 'Execution completed.');
@@ -690,6 +772,8 @@ export default function Chat() {
 
     const userMessageId = createLocalMessageId('user');
     const assistantMessageId = createLocalMessageId('assistant-live');
+    shouldAutoScrollRef.current = true;
+    setIsUserNearBottom(true);
     setMessages(prev => [
       ...prev,
       { local_id: userMessageId, role: 'user', content: userMsg },
@@ -886,6 +970,16 @@ export default function Chat() {
             </button>
             <button
               type="button"
+              disabled={!selectedThreadIsProcessing || isStoppingRun}
+              onClick={stopActiveRun}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              title="Stop current agent execution"
+            >
+              <Square className="w-3.5 h-3.5" />
+              {isStoppingRun ? 'Stopping...' : 'Stop'}
+            </button>
+            <button
+              type="button"
               disabled={!selectedThreadId || isLoading || selectedThreadIsProcessing}
               onClick={async () => {
                 if (!selectedThreadId) return;
@@ -921,7 +1015,11 @@ export default function Chat() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 bg-[radial-gradient(circle_at_20%_20%,rgba(125,211,252,0.15),transparent_45%),radial-gradient(circle_at_80%_5%,rgba(226,232,240,0.45),transparent_40%)]">
+        <div
+          ref={messagesContainerRef}
+          onScroll={handleMessagesScroll}
+          className="relative flex-1 overflow-y-auto p-4 md:p-8 space-y-6 bg-[radial-gradient(circle_at_20%_20%,rgba(125,211,252,0.15),transparent_45%),radial-gradient(circle_at_80%_5%,rgba(226,232,240,0.45),transparent_40%)]"
+        >
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-4">
               <Bot className="w-16 h-16 opacity-25" />
@@ -1033,6 +1131,18 @@ export default function Chat() {
                   {activeAssistantMessage?.showDetails ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                 </button>
               </div>
+            </div>
+          )}
+          {selectedThreadIsProcessing && !isUserNearBottom && (
+            <div className="sticky bottom-4 z-10 flex justify-end pr-1">
+              <button
+                type="button"
+                onClick={() => scrollToBottom('smooth')}
+                className="inline-flex items-center gap-1 rounded-full border border-sky-300 bg-white/95 px-3 py-1.5 text-xs font-medium text-sky-700 shadow-sm hover:bg-sky-50"
+              >
+                Live
+                <ChevronDown className="h-3.5 w-3.5" />
+              </button>
             </div>
           )}
           <div ref={messagesEndRef} />
