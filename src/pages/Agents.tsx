@@ -125,19 +125,19 @@ const AGENT_TEMPLATES: Record<string, any> = {
     persona: "Knowledgeable, academic, and citation-focused."
   },
   rss_news: {
-    config: { feed_urls: "https://news.ycombinator.com/rss", interests: "technology, AI", exclude_keywords: "sports", top_k: 10, max_items_per_feed: 5, hours_lookback: 24, language_hint: "en", include_general_if_no_match: true },
+    config: { feed_urls: "https://news.ycombinator.com/rss", interests: "technology, AI", exclude_keywords: "sports", top_k: 10, max_items_per_feed: 5, hours_lookback: 24, language_hint: "en", include_general_if_no_match: true, allow_reader_proxy: true, google_news_fallback: true },
     role: "News Briefing Analyst",
     objectives: "Fetch, filter, and score RSS/Atom feeds to provide a highly relevant and deduplicated news briefing.",
     persona: "Informed, objective, and concise."
   },
   web_scraper: {
-    config: { start_urls: "https://example.com", include_urls_from_question: true, search_fallback: true, follow_links: false, same_domain_only: true, allowed_domains: "example.com", max_pages: 3, max_links_per_page: 10, max_chars_per_page: 10000, timeout_seconds: 15, region: "us-en", safe_search: true },
+    config: { start_urls: "https://example.com", include_urls_from_question: true, search_fallback: true, follow_links: false, same_domain_only: true, allowed_domains: "example.com", max_pages: 3, max_links_per_page: 10, max_chars_per_page: 10000, timeout_seconds: 15, region: "us-en", safe_search: true, allow_reader_proxy: true },
     role: "Web Scraping Specialist",
     objectives: "Extract and synthesize text from web pages, using search fallbacks when necessary.",
     persona: "Resourceful, fast, and analytical."
   },
   web_navigator: {
-    config: { start_url: "https://google.com", headless: true, max_steps: 10, timeout_ms: 30000, capture_html_chars: 5000 },
+    config: { start_url: "https://google.com", headless: true, max_steps: 10, timeout_ms: 30000, capture_html_chars: 5000, allow_reader_proxy: true, google_news_fallback: true, language_hint: "fr" },
     role: "Autonomous Web Navigator",
     objectives: "Navigate web pages, interact with elements, and extract information to accomplish complex tasks.",
     persona: "Action-oriented, persistent, and adaptable."
